@@ -1,16 +1,3 @@
-"""
-MIMU Jobs PDF Extractor
-========================
-Reads PDF URLs from the published Google Sheet, downloads each PDF,
-extracts text, and saves enriched job data to a CSV file.
-
-REQUIREMENTS:
-    pip install requests pdfplumber pandas
-
-USAGE:
-    python mimu_jobs_extractor.py
-"""
-
 import requests
 import pdfplumber
 import pandas as pd
@@ -226,30 +213,29 @@ def parse_pdf_fields(text: str, row: dict) -> dict:
     comp_type   = detect_company_type(text) or row.get("Company Type", "")
 
     return {
-        "Job Title":          title,
-        "Job Type":           job_type,
-        "Job Qualifications": quals[:300],
-        "Job Experience":     exp[:200],
-        "Job Location":       location,
-        "Job Field":          job_field,
-        "Date Posted":        row.get("Date Posted", ""),
-        "Deadline":           deadline,
-        "Job Description":    desc,
-        "Application":        app_url,
-        "Company URL":        website,
-        "Company Name":       org,
-        "Company Industry":   job_field,
-        "Company Type":       comp_type,
-        "Company Website":    website,
-        "Company Address":    address,
-        "Company Details":    details[:400],
-        "Job URL":            row.get("Job URL", ""),
-        "Estimated Deadline": deadline,
-        "Salary Range":       salary,
-        "PDF URL":            row.get("PDF URL", ""),
+        "Job Title":          str(title or ""),
+        "Job Type":           str(job_type or ""),
+        "Job Qualifications": str(quals or "")[:300],
+        "Job Experience":     str(exp or "")[:200],
+        "Job Location":       str(location or ""),
+        "Job Field":          str(job_field or ""),
+        "Date Posted":        str(row.get("Date Posted", "") or ""),
+        "Deadline":           str(deadline or ""),
+        "Job Description":    str(desc or ""),
+        "Application":        str(app_url or ""),
+        "Company URL":        str(website or ""),
+        "Company Name":       str(org or ""),
+        "Company Industry":   str(job_field or ""),
+        "Company Type":       str(comp_type or ""),
+        "Company Website":    str(website or ""),
+        "Company Address":    str(address or ""),
+        "Company Details":    str(details or "")[:400],
+        "Job URL":            str(row.get("Job URL", "") or ""),
+        "Estimated Deadline": str(deadline or ""),
+        "Salary Range":       str(salary or ""),
+        "PDF URL":            str(row.get("PDF URL", "") or ""),
         "PDF Text Length":    len(text),
     }
-
 # ── Main ───────────────────────────────────────────────────────────────────────
 
 def main():
