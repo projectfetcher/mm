@@ -1,10 +1,24 @@
-import requests 
+"""
+MIMU Jobs PDF Extractor
+========================
+Reads PDF URLs from the published Google Sheet CSV, downloads each PDF,
+extracts full text, parses all fields, and saves to mimu_jobs.csv.
+
+REQUIREMENTS:
+    pip install requests pdfplumber pandas
+
+USAGE:
+    python mimu_jobs_extractor.py
+"""
+
+import requests
 import pdfplumber
 import pandas as pd
 import re
 import io
 import time
 import sys
+import math
 from datetime import datetime
 
 # ── Config ─────────────────────────────────────────────────────────────────────
@@ -15,7 +29,32 @@ SHEET_CSV_URL = (
     "/pub?gid=964760760&single=true&output=csv"
 )
 
-OUTPUT_FILE = f"mimu_jobs_enriched_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+OUTPUT_FILE = "mimu_jobs.csv"
+
+OUTPUT_COLUMNS = [
+    "Job Title",
+    "Job Type",
+    "Job Qualifications",
+    "Job Experience",
+    "Job Location",
+    "Job Field",
+    "Date Posted",
+    "Deadline",
+    "Job Description",
+    "Application",
+    "Company URL",
+    "Company Name",
+    "Company Logo",
+    "Company Industry",
+    "Company Founded",
+    "Company Type",
+    "Company Website",
+    "Company Address",
+    "Company Details",
+    "Job URL",
+    "Estimated Deadline",
+    "Salary Range",
+]
 
 HEADERS = {
     "User-Agent": (
@@ -51,16 +90,25 @@ JOB_TYPE_KEYWORDS = {
     "Contract":    ["contract", "fixed-term", "fixed term", "temporary"],
 }
 
+# ── Safe string helper ─────────────────────────────────────────────────────────
+
+def s(val) -> str:
+    """Safely convert any value (including NaN/None/float) to string."""
+    if val is None:
+        return ""
+    if isinstance(val, float) and math.isnan(val):
+        return ""
+    return str(val).strip()
+
 # ── PDF downloader ─────────────────────────────────────────────────────────────
 
 def fetch_pdf_text(pdf_url: str) -> str:
-    """Download a PDF and extract all text using pdfplumber."""
-    if not pdf_url or not pdf_url.startswith("http"):
+    if not pdf_url or not str(pdf_url).startswith("http"):
         return ""
     try:
         resp = requests.get(pdf_url, headers=HEADERS, timeout=30)
         if resp.status_code != 200:
-            print(f"    ✗ HTTP {resp.status_code}")
+            print(f"      ✗ HTTP {resp.status_code}")
             return ""
         with pdfplumber.open(io.BytesIO(resp.content)) as pdf:
             pages = []
@@ -70,7 +118,7 @@ def fetch_pdf_text(pdf_url: str) -> str:
                     pages.append(text)
             return "\n".join(pages)
     except Exception as e:
-        print(f"    ✗ PDF error: {e}")
+        print(f"      ✗ PDF error: {e}")
         return ""
 
 # ── Text field extractors ──────────────────────────────────────────────────────
@@ -125,25 +173,75 @@ def detect_company_type(text: str) -> str:
         return "Private Sector"
     return ""
 
-def parse_pdf_fields(text: str, row: dict) -> dict:
-    """Merge PDF-extracted fields with existing sheet metadata."""
-    tl = text.lower()
+def detect_company_founded(text: str) -> str:
+    m = re.search(r'(?:established|founded|since)\s+(?:in\s+)?(\d{4})', text, re.IGNORECASE)
+    if m:
+        return m.group(1)
+    return ""
 
-    title    = row.get("Job Title", "") or search_pattern(text, [
+# ── Verbose printer ────────────────────────────────────────────────────────────
+
+def print_extracted(record: dict, pdf_text: str):
+    pad = "      "
+    div = pad + "-" * 56
+    print(div)
+    fields_to_show = [
+        ("Job Title",          20),
+        ("Job Type",           20),
+        ("Job Field",          20),
+        ("Job Location",       20),
+        ("Date Posted",        20),
+        ("Deadline",           20),
+        ("Estimated Deadline", 20),
+        ("Salary Range",       20),
+        ("Job Qualifications", 80),
+        ("Job Experience",     80),
+        ("Application",        80),
+        ("Company Name",       40),
+        ("Company Type",       20),
+        ("Company Founded",    10),
+        ("Company Website",    80),
+        ("Company Address",    80),
+    ]
+    for field, maxlen in fields_to_show:
+        val = record.get(field, "")
+        if val:
+            label = (field + ":").ljust(22)
+            display = val[:maxlen] + ("…" if len(val) > maxlen else "")
+            print(f"{pad}{label} {display}")
+
+    desc = record.get("Job Description", "")
+    if desc:
+        print(f"{pad}{'Job Description:'.ljust(22)} {desc[:150]}{'…' if len(desc) > 150 else ''}")
+
+    details = record.get("Company Details", "")
+    if details:
+        print(f"{pad}{'Company Details:'.ljust(22)} {details[:120]}{'…' if len(details) > 120 else ''}")
+
+    if pdf_text:
+        snippet = " ".join(pdf_text[:400].split())
+        print(f"\n{pad}--- PDF RAW SNIPPET (first 400 chars) ---")
+        print(f"{pad}{snippet[:400]}")
+    print(div)
+
+# ── Field parser ───────────────────────────────────────────────────────────────
+
+def parse_pdf_fields(text: str, row: dict) -> dict:
+    title    = s(row.get("Job Title", "")) or search_pattern(text, [
         r'position[:\s]+([^\n]{3,80})',
         r'job title[:\s]+([^\n]{3,80})',
     ])
-    location = row.get("Job Location", "") or search_pattern(text, [
+    location = s(row.get("Job Location", "")) or search_pattern(text, [
         r'location[:\s]+([^\n]{3,80})',
         r'duty station[:\s]+([^\n]{3,80})',
     ])
-    deadline = row.get("Deadline", "") or search_pattern(text, [
+    deadline = s(row.get("Deadline", "")) or search_pattern(text, [
         r'closing date[:\s]+([^\n]{3,40})',
         r'deadline[:\s]+([^\n]{3,40})',
         r'application deadline[:\s]+([^\n]{3,40})',
     ])
 
-    # Qualifications — prefer PDF text over sheet
+    # Qualifications
     quals = search_block(text, [r'qualif', r'education', r'academic', r'degree required'], 5)
     if not quals:
         quals = search_pattern(text, [
@@ -151,7 +249,7 @@ def parse_pdf_fields(text: str, row: dict) -> dict:
             r"(bachelor'?s?|master'?s?|phd|diploma|degree)[^\n]{0,100}",
         ])
     if not quals:
-        quals = str(row.get("Job Qualifications", "") or "")
+        quals = s(row.get("Job Qualifications", ""))
 
     # Experience
     exp = search_pattern(text, [
@@ -161,15 +259,15 @@ def parse_pdf_fields(text: str, row: dict) -> dict:
         r'(at least\s+\d+\s+years?[^\n]{0,50})',
     ])
     if not exp:
-        exp = str(row.get("Job Experience", "") or "")
+        exp = s(row.get("Job Experience", ""))
 
-    # Description — prefer PDF
+    # Description
     desc = search_block(text, [r'responsibilit', r'duties', r'key tasks', r'scope of work', r'objective'], 8)
     if not desc:
         long_lines = [l.strip() for l in text.split("\n") if len(l.strip()) > 40]
         desc = " ".join(long_lines[:4])
     if not desc:
-        desc = str(row.get("Job Description", "") or "")
+        desc = s(row.get("Job Description", ""))
     desc = str(desc or "")[:500]
 
     # Salary
@@ -179,10 +277,10 @@ def parse_pdf_fields(text: str, row: dict) -> dict:
         r'([\d,]+\s*(?:MMK|USD|Ks|Kyats)[^\n]{0,30})',
     ])
     if not salary:
-        salary = str(row.get("Salary Range", "") or "")
+        salary = s(row.get("Salary Range", ""))
 
     # Application URL
-    app_url = row.get("Application", "") or search_pattern(text, [r'apply[:\s]+(https?://\S+)'])
+    app_url = s(row.get("Application", "")) or search_pattern(text, [r'apply[:\s]+(https?://\S+)'])
 
     # Company website
     website = search_pattern(text, [
@@ -190,7 +288,7 @@ def parse_pdf_fields(text: str, row: dict) -> dict:
         r'(https?://(?!.*apply|.*career|.*job)\S{10,})',
     ])
     if not website:
-        website = row.get("Company Website", "") or row.get("Company URL", "")
+        website = s(row.get("Company Website", "")) or s(row.get("Company URL", ""))
 
     # Address
     address = search_pattern(text, [
@@ -198,19 +296,20 @@ def parse_pdf_fields(text: str, row: dict) -> dict:
         r'office[:\s]+([^\n]{10,120})',
     ])
     if not address:
-        address = row.get("Company Address", "")
+        address = s(row.get("Company Address", ""))
 
     # Company details
-    org = row.get("Company Name", "")
+    org = s(row.get("Company Name", ""))
     org_escaped = re.escape(org[:10]) if org else ""
     detail_pats = ([rf'about\s+(?:us|the\s+organization|{org_escaped})'] if org_escaped else []) + [r'background']
     details = search_block(text, detail_pats, 6)
     if not details:
-        details = row.get("Company Details", "")
+        details = s(row.get("Company Details", ""))
 
-    job_type    = detect_job_type(text, title)
-    job_field   = detect_job_field(text, title)
-    comp_type   = detect_company_type(text) or row.get("Company Type", "")
+    job_type  = detect_job_type(text, title)
+    job_field = detect_job_field(text, title)
+    comp_type = detect_company_type(text) or s(row.get("Company Type", ""))
+    founded   = detect_company_founded(text)
 
     return {
         "Job Title":          str(title or ""),
@@ -219,35 +318,36 @@ def parse_pdf_fields(text: str, row: dict) -> dict:
         "Job Experience":     str(exp or "")[:200],
         "Job Location":       str(location or ""),
         "Job Field":          str(job_field or ""),
-        "Date Posted":        str(row.get("Date Posted", "") or ""),
+        "Date Posted":        str(s(row.get("Date Posted", ""))),
         "Deadline":           str(deadline or ""),
         "Job Description":    str(desc or ""),
         "Application":        str(app_url or ""),
         "Company URL":        str(website or ""),
         "Company Name":       str(org or ""),
+        "Company Logo":       "",
         "Company Industry":   str(job_field or ""),
+        "Company Founded":    str(founded or ""),
         "Company Type":       str(comp_type or ""),
         "Company Website":    str(website or ""),
         "Company Address":    str(address or ""),
         "Company Details":    str(details or "")[:400],
-        "Job URL":            str(row.get("Job URL", "") or ""),
+        "Job URL":            str(s(row.get("Job URL", ""))),
         "Estimated Deadline": str(deadline or ""),
         "Salary Range":       str(salary or ""),
-        "PDF URL":            str(row.get("PDF URL", "") or ""),
-        "PDF Text Length":    len(text),
     }
+
 # ── Main ───────────────────────────────────────────────────────────────────────
 
 def main():
     print("=" * 60)
     print("MIMU Jobs PDF Extractor")
+    print(f"Started : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print("=" * 60)
 
     # 1. Load sheet
     print(f"\n[1/3] Fetching Google Sheet CSV …")
     try:
         df = pd.read_csv(SHEET_CSV_URL)
-        # Drop completely empty rows
         df = df.dropna(how="all")
         print(f"      Loaded {len(df)} rows.")
     except Exception as e:
@@ -255,40 +355,56 @@ def main():
         sys.exit(1)
 
     if "PDF URL" not in df.columns:
-        print("ERROR: 'PDF URL' column not found in sheet.")
-        print("Columns found:", list(df.columns))
+        print("ERROR: 'PDF URL' column not found.")
+        print("Columns:", list(df.columns))
         sys.exit(1)
 
     # 2. Process each row
-    print(f"\n[2/3] Downloading PDFs and extracting fields …\n")
+    print(f"\n[2/3] Downloading PDFs and extracting fields …")
     records = []
-    total = len(df)
+    total         = len(df)
+    success_count = 0
+    skip_count    = 0
 
     for idx, row in df.iterrows():
-        pdf_url = str(row.get("PDF URL", "")).strip()
-        title   = str(row.get("Job Title", "")).strip()
+        pdf_url = s(row.get("PDF URL", ""))
+        title   = s(row.get("Job Title", ""))
         num     = idx + 1
 
-        print(f"  [{num}/{total}] {title}")
+        print(f"\n  [{num}/{total}] {title}")
 
         if pdf_url and pdf_url.startswith("http"):
-            print(f"    → {pdf_url}")
+            print(f"      PDF : {pdf_url}")
             pdf_text = fetch_pdf_text(pdf_url)
-            print(f"    ✓ {len(pdf_text):,} chars extracted")
+            if pdf_text:
+                print(f"      ✓ {len(pdf_text):,} characters extracted")
+                success_count += 1
+            else:
+                print(f"      ⚠ No text extracted from PDF")
+                skip_count += 1
         else:
-            print(f"    ⚠ No PDF URL — using sheet data only")
+            print(f"      ⚠ No PDF URL — using sheet data only")
             pdf_text = ""
+            skip_count += 1
 
         enriched = parse_pdf_fields(pdf_text, row.to_dict())
+        print_extracted(enriched, pdf_text)
         records.append(enriched)
 
-        time.sleep(0.3)  # be polite
+        time.sleep(0.3)
 
-    # 3. Save output
+    # 3. Save
     print(f"\n[3/3] Saving to {OUTPUT_FILE} …")
-    out_df = pd.DataFrame(records)
+    out_df = pd.DataFrame(records, columns=OUTPUT_COLUMNS)
     out_df.to_csv(OUTPUT_FILE, index=False, encoding="utf-8-sig")
-    print(f"      ✅ Done! {len(records)} jobs saved to '{OUTPUT_FILE}'")
+
+    print(f"\n{'=' * 60}")
+    print(f"✅ COMPLETE")
+    print(f"   Total        : {total}")
+    print(f"   PDF success  : {success_count}")
+    print(f"   Sheet-only   : {skip_count}")
+    print(f"   Output       : {OUTPUT_FILE}")
+    print(f"   Finished     : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print("=" * 60)
 
 
