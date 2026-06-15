@@ -1,0 +1,66 @@
+name: Scraper
+
+on:
+  # Run automatically every weekday at 06:00 UTC
+  schedule:
+    - cron: "0 6 * * 1-5"
+
+  # Allow manual trigger from the Actions tab
+  workflow_dispatch:
+
+jobs:
+  scrape:
+    name: Scrape & Export Jobs
+    runs-on: ubuntu-latest
+   
+    steps:
+      # ── 1. Checkout ──────────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. Python setup ──────────────────────────────────────────────────────
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      # ── 3. Install dependencies ───────────────────────────────────────────────
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # ── 4. Run scraper ────────────────────────────────────────────────────────
+      - name: Run MIMU Jobs Scraper
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: python mimu_jobs_scraper.py
+
+      # ── 5. Upload Excel as artifact ───────────────────────────────────────────
+      - name: Upload Excel report
+        uses: actions/upload-artifact@v4
+        with:
+          name: mimu-jobs-${{ github.run_id }}
+          path: mimu_jobs_*.xlsx
+          retention-days: 30        # keep for 30 days; adjust as needed
+
+      # ── 6. Upload debug HTML if it was created (only on parse failure) ────────
+      - name: Upload debug HTML (if present)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-html-${{ github.run_id }}
+          path: debug_page.html
+          if-no-files-found: ignore  # silently skip if parse succeeded
+
+      # ── 7. (Optional) Commit Excel back to repo ───────────────────────────────
+      # Uncomment the block below if you want the Excel saved in the repo itself.
+      # Make sure your repo's Settings → Actions → General → Workflow permissions
+      # is set to "Read and write permissions".
+      #
+      # - name: Commit Excel to repository
+      #   run: |
+      #     git config user.name  "github-actions[bot]"
+      #     git config user.email "github-actions[bot]@users.noreply.github.com"
+      #     git add mimu_jobs_*.xlsx
+      #     git diff --cached --quiet || git commit -m "chore: update MIMU jobs $(date +%Y-%m-%d)"
+      #     git push
