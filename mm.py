@@ -1,4 +1,4 @@
-import requests
+import requests 
 import pdfplumber
 import pandas as pd
 import re
@@ -151,7 +151,7 @@ def parse_pdf_fields(text: str, row: dict) -> dict:
             r"(bachelor'?s?|master'?s?|phd|diploma|degree)[^\n]{0,100}",
         ])
     if not quals:
-        quals = row.get("Job Qualifications", "")
+        quals = str(row.get("Job Qualifications", "") or "")
 
     # Experience
     exp = search_pattern(text, [
@@ -161,7 +161,7 @@ def parse_pdf_fields(text: str, row: dict) -> dict:
         r'(at least\s+\d+\s+years?[^\n]{0,50})',
     ])
     if not exp:
-        exp = row.get("Job Experience", "")
+        exp = str(row.get("Job Experience", "") or "")
 
     # Description — prefer PDF
     desc = search_block(text, [r'responsibilit', r'duties', r'key tasks', r'scope of work', r'objective'], 8)
@@ -169,8 +169,8 @@ def parse_pdf_fields(text: str, row: dict) -> dict:
         long_lines = [l.strip() for l in text.split("\n") if len(l.strip()) > 40]
         desc = " ".join(long_lines[:4])
     if not desc:
-        desc = row.get("Job Description", "")
-    desc = desc[:500]
+        desc = str(row.get("Job Description", "") or "")
+    desc = str(desc or "")[:500]
 
     # Salary
     salary = search_pattern(text, [
@@ -179,7 +179,7 @@ def parse_pdf_fields(text: str, row: dict) -> dict:
         r'([\d,]+\s*(?:MMK|USD|Ks|Kyats)[^\n]{0,30})',
     ])
     if not salary:
-        salary = row.get("Salary Range", "")
+        salary = str(row.get("Salary Range", "") or "")
 
     # Application URL
     app_url = row.get("Application", "") or search_pattern(text, [r'apply[:\s]+(https?://\S+)'])
