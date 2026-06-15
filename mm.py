@@ -1,6 +1,26 @@
+#!/usr/bin/env python3
+"""
+MIMU Jobs Scraper
+=================
+Scrapes ALL job listings from https://themimu.info/jobs-for-myanmar-nationals
+Downloads each PDF, extracts text, then uses regex/keyword parsing to extract
+structured job fields — saving everything to an Excel file.
+
+NO API KEY REQUIRED. No external AI services used.
+
+Requirements:
+    pip install requests pdfplumber pandas openpyxl beautifulsoup4
+
+Usage:
+    python mimu_jobs_scraper.py
+
+Output:
+    mimu_jobs_YYYYMMDD.xlsx  — structured job data
+    pdfs/                    — downloaded PDF files
+"""
+
 import os
 import re
-import json
 import time
 import datetime
 import requests
@@ -8,7 +28,6 @@ import pdfplumber
 import pandas as pd
 from pathlib import Path
 from bs4 import BeautifulSoup
-import anthropic
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 BASE_URL   = "https://themimu.info"
@@ -16,19 +35,19 @@ JOBS_URL   = f"{BASE_URL}/jobs-for-myanmar-nationals"
 PDF_DIR    = Path("pdfs")
 OUTPUT_XLS = f"mimu_jobs_{datetime.date.today():%Y%m%d}.xlsx"
 
-# NOTE: The MIMU site renders ALL jobs on a single page — no pagination needed.
-# We do, however, handle the case where the site returns partial HTML by
-# checking the total row count after parsing.
-
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/124.0.0.0 Safari/537.36"
-    )
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.5",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
 }
 
-# Fields we want in the output
 OUTPUT_COLUMNS = [
     "Job Title", "Job Type", "Job Qualifications", "Job Experience",
     "Job Location", "Job Field", "Date Posted", "Deadline",
@@ -38,10 +57,37 @@ OUTPUT_COLUMNS = [
     "Job URL", "Estimated Deadline", "Salary Range",
 ]
 
+# ── Sector / field keyword map ─────────────────────────────────────────────────
+FIELD_KEYWORDS = {
+    "Health":         ["health", "medical", "doctor", "nurse", "clinical", "pharmacy", "nutrition", "epidemic", "disease"],
+    "Logistics":      ["logistics", "supply chain", "fleet", "transport", "warehouse", "procurement"],
+    "Finance":        ["finance", "accounting", "audit", "budget", "financial", "grants", "treasury"],
+    "WASH":           ["wash", "water", "sanitation", "hygiene", "latrine"],
+    "Protection":     ["protection", "gbv", "gender", "child protection", "safeguarding", "legal aid"],
+    "Education":      ["education", "teacher", "school", "training", "learning", "teacher"],
+    "HR":             ["human resource", "hr ", "recruitment", "personnel", "talent"],
+    "Administration": ["admin", "administration", "office management", "receptionist"],
+    "Food Security":  ["food security", "livelihoods", "agriculture", "food assistance"],
+    "Shelter":        ["shelter", "nfi", "construction", "engineer", "infrastructure"],
+    "CCCM":           ["cccm", "camp", "site management"],
+    "Nutrition":      ["nutrition", "malnutrition", "stunting", "wasting", "feeding"],
+    "IT":             ["it ", "information technology", "software", "developer", "database", "network", "ict"],
+    "Communications": ["communication", "media", "journalist", "reporting", "public relations", "advocacy"],
+    "Legal":          ["legal", "lawyer", "compliance", "policy"],
+}
+
+JOB_TYPE_KEYWORDS = {
+    "Consultancy":  ["consultanc", "consultant", "consultancy", "TOR", "terms of reference"],
+    "Internship":   ["intern", "internship"],
+    "Part-time":    ["part-time", "part time"],
+    "Contract":     ["contract", "fixed-term", "fixed term", "temporary"],
+    "Full-time":    ["full-time", "full time", "permanent", "national staff"],
+}
+
+
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
 def fetch_page(url: str, retries: int = 5) -> str:
-    """Fetch a URL with retry logic, return HTML text."""
     for attempt in range(1, retries + 1):
         try:
             r = requests.get(url, headers=HEADERS, timeout=60)
@@ -49,7 +95,7 @@ def fetch_page(url: str, retries: int = 5) -> str:
             return r.text
         except Exception as e:
             wait = 3 * attempt
-            print(f"  [!] Attempt {attempt}/{retries} failed for {url}: {e}")
+            print(f"  [!] Attempt {attempt}/{retries} failed: {e}")
             if attempt < retries:
                 print(f"      Retrying in {wait}s …")
                 time.sleep(wait)
@@ -57,7 +103,6 @@ def fetch_page(url: str, retries: int = 5) -> str:
 
 
 def download_pdf(url: str, dest: Path) -> bool:
-    """Download a PDF to dest. Returns True on success."""
     if dest.exists() and dest.stat().st_size > 0:
         return True
     try:
@@ -71,36 +116,25 @@ def download_pdf(url: str, dest: Path) -> bool:
 
 
 def extract_pdf_text(pdf_path: Path) -> str:
-    """Extract all text from a PDF using pdfplumber."""
     try:
         with pdfplumber.open(pdf_path) as pdf:
-            pages_text = []
+            parts = []
             for page in pdf.pages:
                 t = page.extract_text()
                 if t:
-                    pages_text.append(t.strip())
-            return "\n".join(pages_text)
+                    parts.append(t.strip())
+            return "\n".join(parts)
     except Exception as e:
         print(f"  [!] PDF text extraction failed ({pdf_path}): {e}")
         return ""
 
 
-def parse_jobs_table(html: str) -> list[dict]:
-    """
-    Parse every job row from the MIMU jobs page.
+# ── Table parser ───────────────────────────────────────────────────────────────
 
-    The page contains a single <table> with columns:
-        Job Title | Job Description (PDF link) | Online Application Link |
-        Post Location | Organisation | Date of upload | Closing Date | Remarks
-
-    All jobs are on one page — no pagination.
-    Returns a list of dicts.
-    """
+def parse_jobs_table(html: str) -> list:
     soup = BeautifulSoup(html, "html.parser")
     jobs = []
 
-    # ── Locate the jobs table ──────────────────────────────────────────────────
-    # Strategy 1: find a table whose header row contains "Closing Date"
     job_table = None
     for table in soup.find_all("table"):
         header_row = table.find("tr")
@@ -110,7 +144,6 @@ def parse_jobs_table(html: str) -> list[dict]:
                 job_table = table
                 break
 
-    # Strategy 2: fallback — first table with ≥ 5 rows
     if not job_table:
         for table in soup.find_all("table"):
             if len(table.find_all("tr")) >= 5:
@@ -124,7 +157,6 @@ def parse_jobs_table(html: str) -> list[dict]:
     rows = job_table.find_all("tr")
     print(f"      Table rows found (inc. header): {len(rows)}")
 
-    # Detect header row to find column indices dynamically
     col_map = {}
     header_row = rows[0]
     for idx, cell in enumerate(header_row.find_all(["th", "td"])):
@@ -146,7 +178,6 @@ def parse_jobs_table(html: str) -> list[dict]:
         elif "remark" in text:
             col_map["remarks"] = idx
 
-    # Fallback column positions (matches observed site structure)
     defaults = {
         "title": 0, "pdf": 1, "app": 2,
         "location": 3, "org": 4, "date_posted": 5,
@@ -155,13 +186,12 @@ def parse_jobs_table(html: str) -> list[dict]:
     for k, v in defaults.items():
         col_map.setdefault(k, v)
 
-    # ── Parse data rows ────────────────────────────────────────────────────────
     for row in rows[1:]:
         cols = row.find_all(["td", "th"])
         if not cols:
             continue
 
-        def get_col(key: str) -> "BeautifulSoup | None":
+        def get_col(key):
             idx = col_map.get(key, -1)
             return cols[idx] if 0 <= idx < len(cols) else None
 
@@ -176,20 +206,15 @@ def parse_jobs_table(html: str) -> list[dict]:
 
         if not title_cell:
             continue
-
         title = title_cell.get_text(strip=True)
-
-        # Skip header-like rows
         if not title or title.lower() in ("job title", "title"):
             continue
 
-        # ── PDF link ─────────────────────────────────────────────────────────
         pdf_url = ""
         if pdf_cell:
             dl_link = pdf_cell.find("a", href=True)
             if dl_link:
                 href = dl_link["href"]
-                # Handle relative, absolute, and protocol-relative paths
                 if href.startswith("http"):
                     pdf_url = href
                 elif href.startswith("//"):
@@ -197,7 +222,6 @@ def parse_jobs_table(html: str) -> list[dict]:
                 else:
                     pdf_url = BASE_URL.rstrip("/") + "/" + href.lstrip("/")
 
-        # ── Application URL ───────────────────────────────────────────────────
         app_url = ""
         if app_cell:
             app_link = app_cell.find("a", href=True)
@@ -205,17 +229,15 @@ def parse_jobs_table(html: str) -> list[dict]:
                 app_url = app_link["href"]
             else:
                 raw = app_cell.get_text(strip=True)
-                # Only keep it if it looks like a URL or email
                 if raw.startswith("http") or "@" in raw:
                     app_url = raw
 
-        location   = loc_cell.get_text("  ", strip=True) if loc_cell   else ""
-        org        = org_cell.get_text(strip=True)        if org_cell   else ""
-        date_posted= posted_cell.get_text(strip=True)     if posted_cell   else ""
-        deadline   = deadline_cell.get_text(strip=True)   if deadline_cell else ""
-        remarks    = remarks_cell.get_text(strip=True)    if remarks_cell  else ""
+        location    = loc_cell.get_text("  ", strip=True)  if loc_cell      else ""
+        org         = org_cell.get_text(strip=True)         if org_cell      else ""
+        date_posted = posted_cell.get_text(strip=True)      if posted_cell   else ""
+        deadline    = deadline_cell.get_text(strip=True)    if deadline_cell else ""
+        remarks     = remarks_cell.get_text(strip=True)     if remarks_cell  else ""
 
-        # Normalise multi-whitespace in location
         location = re.sub(r"\s{2,}", ", ", location).strip(", ")
 
         jobs.append({
@@ -233,86 +255,217 @@ def parse_jobs_table(html: str) -> list[dict]:
     return jobs
 
 
-def ai_extract_fields(raw_text: str, meta: dict, client: anthropic.Anthropic) -> dict:
+# ── Regex-based field extractor (replaces Claude AI) ──────────────────────────
+
+def _search(patterns: list, text: str, flags=re.IGNORECASE) -> str:
+    """Return first non-empty match group from a list of regex patterns."""
+    for pattern in patterns:
+        m = re.search(pattern, text, flags)
+        if m:
+            result = m.group(1).strip(" :.,-\t")
+            if result:
+                return result
+    return ""
+
+
+def _search_block(header_patterns: list, text: str, max_lines: int = 6) -> str:
     """
-    Use Claude to extract structured fields from PDF text + table metadata.
-    Falls back to table metadata if AI call fails.
+    Find a section header then grab the next max_lines lines as content.
+    Good for multi-line fields like Job Description or Qualifications.
     """
-    system_prompt = """You are a job-listing data extractor for an NGO/humanitarian sector job board.
-Given raw text from a job vacancy PDF and some metadata already known from the website table,
-return ONLY a valid JSON object (no markdown fences, no explanation) with these exact keys:
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        for pat in header_patterns:
+            if re.search(pat, line, re.IGNORECASE):
+                block_lines = []
+                for j in range(i + 1, min(i + 1 + max_lines, len(lines))):
+                    l = lines[j].strip()
+                    if not l:
+                        continue
+                    # Stop if we hit another section header (ALL CAPS or ends with colon)
+                    if re.match(r'^[A-Z][A-Z\s]{4,}:?\s*$', l) or (l.endswith(":") and len(l) < 50):
+                        break
+                    block_lines.append(l)
+                if block_lines:
+                    return " ".join(block_lines)
+    return ""
 
-Job Title, Job Type, Job Qualifications, Job Experience, Job Location,
-Job Field, Date Posted, Deadline, Job Description, Application,
-Company URL, Company Name, Company Logo, Company Industry,
-Company Founded, Company Type, Company Website, Company Address,
-Company Details, Job URL, Estimated Deadline, Salary Range
 
-Rules:
-- Use metadata values when the PDF does not contain better information.
-- "Job Description" — concise 2–4 sentence summary of duties/responsibilities.
-- "Job Qualifications" — key education / certification requirements only.
-- "Job Experience" — years and type of experience required.
-- "Job Type" — infer from context: Full-time / Part-time / Contract / Consultancy / Internship.
-- "Job Field" — sector keyword: Health / Logistics / Finance / WASH / Protection / Education /
-  HR / Administration / Food Security / Shelter / CCCM / Nutrition / IT / Communications / Legal / Other.
-- "Salary Range" — extract if explicitly stated, else leave blank.
-- "Estimated Deadline" — same as Deadline if present, else blank.
-- "Company Name" — the hiring organisation abbreviation expanded where obvious, e.g. IRC → International Rescue Committee.
-- For fields not found leave empty string "".
-- NEVER invent information not in the text or metadata.
-"""
+def detect_job_field(text: str) -> str:
+    text_lower = text.lower()
+    for field, keywords in FIELD_KEYWORDS.items():
+        if any(kw in text_lower for kw in keywords):
+            return field
+    return "Other"
 
-    user_msg = f"""METADATA (from website table):
-Title:       {meta.get('title', '')}
-Organisation:{meta.get('org', '')}
-Location:    {meta.get('location', '')}
-Date Posted: {meta.get('date_posted', '')}
-Deadline:    {meta.get('deadline', '')}
-App URL:     {meta.get('app_url', '')}
-Job URL:     {meta.get('job_url', '')}
 
-PDF TEXT (first 4000 chars):
-{raw_text[:4000]}
-"""
+def detect_job_type(text: str) -> str:
+    text_lower = text.lower()
+    for jtype, keywords in JOB_TYPE_KEYWORDS.items():
+        if any(kw in text_lower for kw in keywords):
+            return jtype
+    return "Full-time"
 
-    try:
-        response = client.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=1200,
-            system=system_prompt,
-            messages=[{"role": "user", "content": user_msg}]
-        )
-        raw_json = response.content[0].text.strip()
-        # Strip markdown fences if present
-        raw_json = re.sub(r"^```(?:json)?\s*|```$", "", raw_json, flags=re.MULTILINE).strip()
-        return json.loads(raw_json)
-    except json.JSONDecodeError as e:
-        print(f"  [!] JSON parse error: {e}")
-    except Exception as e:
-        print(f"  [!] AI extraction failed: {e}")
 
-    # ── Fallback: populate from metadata only ──────────────────────────────────
+def extract_salary(text: str) -> str:
+    patterns = [
+        r'salary[:\s]+([^\n]{5,60})',
+        r'remuneration[:\s]+([^\n]{5,60})',
+        r'compensation[:\s]+([^\n]{5,60})',
+        r'([\$MMK][\d,]+(?:\s*[-–]\s*[\$MMK][\d,]+)?(?:\s*(?:per\s+month|/month|monthly|annually))?)',
+        r'(\d[\d,]+\s*(?:MMK|USD|Ks|Kyats)(?:\s*[-–]\s*\d[\d,]+\s*(?:MMK|USD|Ks|Kyats))?)',
+    ]
+    return _search(patterns, text)
+
+
+def extract_experience(text: str) -> str:
+    patterns = [
+        r'experience[:\s]+([^\n]{5,80})',
+        r'(\d+\+?\s*(?:to\s*\d+\s*)?years?[^\n]{0,50}experience[^\n]{0,30})',
+        r'(minimum\s+\d+\s+years?[^\n]{0,50})',
+        r'(at least\s+\d+\s+years?[^\n]{0,50})',
+    ]
+    return _search(patterns, text)
+
+
+def extract_qualifications(text: str) -> str:
+    # First try a block search
+    block = _search_block(
+        [r'qualif', r'education', r'academic', r'degree required'],
+        text, max_lines=5
+    )
+    if block:
+        return block[:300]
+    # Fallback inline
+    patterns = [
+        r'(?:qualifications?|education)[:\s]+([^\n]{10,200})',
+        r"(bachelor'?s?|master'?s?|phd|diploma|degree)[^\n]{0,100}",
+    ]
+    return _search(patterns, text)[:300]
+
+
+def extract_description(text: str) -> str:
+    """Extract a 2-4 sentence summary from the most descriptive part of the PDF."""
+    # Look for a responsibilities / duties section
+    block = _search_block(
+        [r'responsibilit', r'duties', r'key tasks', r'scope of work', r'objective'],
+        text, max_lines=8
+    )
+    if block:
+        # Trim to ~400 chars
+        return block[:400]
+
+    # Fallback: take the meatiest paragraph (longest line cluster)
+    lines = [l.strip() for l in text.splitlines() if len(l.strip()) > 40]
+    if lines:
+        return " ".join(lines[:4])[:400]
+    return text[:400]
+
+
+def extract_company_website(text: str, app_url: str) -> str:
+    patterns = [
+        r'website[:\s]+(https?://[^\s]+)',
+        r'(https?://(?!.*apply|.*career|.*job|.*lever|.*greenhouse|.*workable)[^\s]{10,})',
+    ]
+    result = _search(patterns, text)
+    if not result and app_url.startswith("http"):
+        # Use domain of app_url as a fallback
+        m = re.match(r'(https?://[^/]+)', app_url)
+        if m:
+            return m.group(1)
+    return result
+
+
+def extract_address(text: str) -> str:
+    patterns = [
+        r'address[:\s]+([^\n]{10,120})',
+        r'office[:\s]+([^\n]{10,120})',
+        r'headquarter[s]?[:\s]+([^\n]{10,80})',
+    ]
+    return _search(patterns, text)
+
+
+def extract_company_details(text: str, org: str) -> str:
+    block = _search_block(
+        [r'about\s+(?:us|the\s+organization|' + re.escape(org[:10]) + r')',
+         r'background', r'organization overview'],
+        text, max_lines=6
+    )
+    return block[:400] if block else ""
+
+
+def parse_fields(raw_text: str, meta: dict) -> dict:
+    """
+    Pure regex/keyword extraction — no API required.
+    Falls back to table metadata where PDF text is unavailable.
+    """
+    text = raw_text or ""
+    org  = meta.get("org", "")
+
+    job_title       = meta.get("title", "") or _search([r'position[:\s]+([^\n]{3,80})', r'job title[:\s]+([^\n]{3,80})'], text)
+    job_location    = meta.get("location", "") or _search([r'location[:\s]+([^\n]{3,80})', r'duty station[:\s]+([^\n]{3,80})'], text)
+    date_posted     = meta.get("date_posted", "")
+    deadline        = meta.get("deadline", "") or _search([
+        r'closing date[:\s]+([^\n]{3,40})',
+        r'deadline[:\s]+([^\n]{3,40})',
+        r'application deadline[:\s]+([^\n]{3,40})',
+    ], text)
+
+    job_type        = detect_job_type(text + " " + job_title)
+    job_field       = detect_job_field(text + " " + job_title)
+    qualifications  = extract_qualifications(text)
+    experience      = extract_experience(text)
+    description     = extract_description(text)
+    salary          = extract_salary(text)
+    app_url         = meta.get("app_url", "") or _search([r'apply[:\s]+(https?://[^\s]+)', r'application[:\s]+(https?://[^\s]+)'], text)
+    company_website = extract_company_website(text, app_url)
+    company_address = extract_address(text)
+    company_details = extract_company_details(text, org)
+
+    # Company type heuristics
+    company_type = ""
+    tl = text.lower()
+    if any(w in tl for w in ["ngo", "non-governmental", "non governmental"]):
+        company_type = "NGO"
+    elif any(w in tl for w in ["united nations", " un ", "undp", "unicef", "wfp", "unhcr", "who ", "ilo "]):
+        company_type = "UN Agency"
+    elif any(w in tl for w in ["government", "ministry", "department of"]):
+        company_type = "Government"
+    elif any(w in tl for w in ["private", "company", "ltd", "limited", "corporation"]):
+        company_type = "Private Sector"
+
+    # Company industry — same as Job Field for NGO context
+    company_industry = job_field
+
     return {
-        "Job Title":          meta.get("title", ""),
-        "Job Location":       meta.get("location", ""),
-        "Date Posted":        meta.get("date_posted", ""),
-        "Deadline":           meta.get("deadline", ""),
-        "Estimated Deadline": meta.get("deadline", ""),
-        "Application":        meta.get("app_url", ""),
-        "Company Name":       meta.get("org", ""),
+        "Job Title":          job_title,
+        "Job Type":           job_type,
+        "Job Qualifications": qualifications,
+        "Job Experience":     experience,
+        "Job Location":       job_location,
+        "Job Field":          job_field,
+        "Date Posted":        date_posted,
+        "Deadline":           deadline,
+        "Job Description":    description,
+        "Application":        app_url,
+        "Company URL":        company_website,
+        "Company Name":       org,
+        "Company Logo":       "",
+        "Company Industry":   company_industry,
+        "Company Founded":    "",
+        "Company Type":       company_type,
+        "Company Website":    company_website,
+        "Company Address":    company_address,
+        "Company Details":    company_details,
         "Job URL":            meta.get("job_url", ""),
-        "Job Description":    raw_text[:500] if raw_text else "",
-        **{k: "" for k in OUTPUT_COLUMNS if k not in [
-            "Job Title", "Job Location", "Date Posted", "Deadline",
-            "Estimated Deadline", "Application", "Company Name",
-            "Job URL", "Job Description",
-        ]}
+        "Estimated Deadline": deadline,
+        "Salary Range":       salary,
     }
 
 
-def save_excel(records: list[dict], path: str):
-    """Save structured records to a nicely formatted Excel file."""
+# ── Excel writer ───────────────────────────────────────────────────────────────
+
+def save_excel(records: list, path: str):
     df = pd.DataFrame(records, columns=OUTPUT_COLUMNS)
 
     with pd.ExcelWriter(path, engine="openpyxl") as writer:
@@ -324,24 +477,24 @@ def save_excel(records: list[dict], path: str):
 
         header_fill = PatternFill(fill_type="solid", fgColor="1F4E79")
         header_font = Font(name="Arial", bold=True, color="FFFFFF", size=10)
-        thin_border = Border(
+        thin = Border(
             left=Side(style="thin"),  right=Side(style="thin"),
             top=Side(style="thin"),   bottom=Side(style="thin"),
         )
 
         for col_idx, col_name in enumerate(OUTPUT_COLUMNS, start=1):
             cell = ws.cell(row=1, column=col_idx)
-            cell.fill   = header_fill
-            cell.font   = header_font
+            cell.fill      = header_fill
+            cell.font      = header_font
             cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-            cell.border = thin_border
+            cell.border    = thin
 
         data_font = Font(name="Arial", size=9)
         for row in ws.iter_rows(min_row=2, max_row=ws.max_row):
             for cell in row:
                 cell.font      = data_font
                 cell.alignment = Alignment(vertical="top", wrap_text=True)
-                cell.border    = thin_border
+                cell.border    = thin
 
         col_widths = {
             "Job Title": 35, "Job Type": 15, "Job Qualifications": 40,
@@ -366,7 +519,6 @@ def save_excel(records: list[dict], path: str):
 
 def main():
     PDF_DIR.mkdir(exist_ok=True)
-    client = anthropic.Anthropic()   # reads ANTHROPIC_API_KEY from environment
 
     print(f"[1/4] Fetching jobs page: {JOBS_URL}")
     html = fetch_page(JOBS_URL)
@@ -380,7 +532,6 @@ def main():
 
     if not jobs:
         print("No jobs found — the page structure may have changed.")
-        # Dump HTML snippet for debugging
         debug_path = Path("debug_page.html")
         debug_path.write_text(html[:5000], encoding="utf-8")
         print(f"      First 5000 chars saved to {debug_path} for inspection.")
@@ -396,7 +547,6 @@ def main():
 
         raw_text = ""
         if pdf_url:
-            # Build a safe filename from the URL's last path segment
             url_slug = re.sub(r"[^\w\-.]", "_", pdf_url.split("/")[-1])[:80]
             if not url_slug.lower().endswith(".pdf"):
                 url_slug += ".pdf"
@@ -409,21 +559,17 @@ def main():
             else:
                 print("      PDF download failed — using metadata only")
         else:
-            print("      No PDF link found — using metadata only")
+            print("      No PDF link — using metadata only")
 
-        print("      Calling Claude to extract fields …")
-        extracted = ai_extract_fields(raw_text, job, client)
-
-        # Ensure every output column is present
+        extracted = parse_fields(raw_text, job)
         row = {col: extracted.get(col, "") for col in OUTPUT_COLUMNS}
         records.append(row)
 
-        # Be polite to servers
-        time.sleep(0.5)
+        time.sleep(0.3)
 
     print("\n[4/4] Saving to Excel …")
     save_excel(records, OUTPUT_XLS)
-    print(f"\nDone! Open '{OUTPUT_XLS}' to see all {len(records)} jobs.\n")
+    print(f"\nDone! Open '{OUTPUT_XLS}' to view all {len(records)} jobs.\n")
 
 
 if __name__ == "__main__":
