@@ -33,7 +33,7 @@ jobs:
       - name: Run MIMU Jobs Scraper
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-        run: python mimu_jobs_scraper.py
+        run: python mm.py
 
       # ── 5. Upload Excel as artifact ───────────────────────────────────────────
       - name: Upload Excel report
