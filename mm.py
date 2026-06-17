@@ -39,7 +39,7 @@ GOOGLE_SHEET_ID = os.environ.get("SHEET_ID", "")
 
 SHEET_CSV_URL = (
     f"https://docs.google.com/spreadsheets/d/e/"
-    f"{GOOGLE_SHEET_ID}/pub?gid=964760760&single=true&output=csv"
+    f"{GOOGLE_SHEET_ID}/pub?gid=595970725&single=true&output=csv"
 )
 
 OUTPUT_CSV         = "mimu_jobs.csv"
