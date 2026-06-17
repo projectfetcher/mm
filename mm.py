@@ -1,18 +1,18 @@
 """
-MIMU Jobs PDF Extractor — v3
+MIMU Jobs PDF Extractor — v4
 ==============================
-Fixes vs v2:
-  - Company Address: much stricter validation — rejects numbers-only, prose
-    sentences, operational words, anything without a real street/city marker
-  - Company Details: website is primary source; PDF "About" section is
-    fallback when no website is available or website scrape returns nothing
-  - Job Type "Volunteer": no longer triggered by "volunteer-based organization"
-    in the org description — only flags if the position itself is volunteer
-  - PDF company details extraction: searches for About/Background/Who We Are
-    sections, then org-name paragraphs, then first descriptive long sentence
+Fixes vs v3:
+  - Logo extraction: pulls the org logo directly from the embedded images
+    in the PDF (page 1, top 35% of page, logo-shaped dimensions).
+    Website logo is used only as fallback if PDF has no suitable image.
+    Logo is stored as a data URI (data:image/png;base64,...) so it works
+    without any external URL.
+  - fetch_pdf() replaces fetch_pdf_text() — downloads once, returns both
+    text (via pdfplumber) and raw bytes (for PyMuPDF image extraction).
+  - Requires: pip install requests pdfplumber pymupdf pandas openpyxl beautifulsoup4
 
 REQUIREMENTS:
-    pip install requests pdfplumber pandas openpyxl beautifulsoup4
+    pip install requests pdfplumber pymupdf pandas openpyxl beautifulsoup4
 
 USAGE:
     python mimu_jobs_extractor.py
@@ -20,9 +20,11 @@ USAGE:
 
 import requests
 import pdfplumber
+import fitz          # PyMuPDF — for embedded image extraction
 import pandas as pd
 import re
 import io
+import base64
 import time
 import sys
 import math
@@ -456,20 +458,137 @@ def get_html(url: str, timeout: int = 15) -> str:
         pass
     return ""
 
-def fetch_pdf_text(pdf_url: str) -> str:
+def fetch_pdf(pdf_url: str):
+    """
+    Download a PDF and return (text, raw_bytes).
+    text      — full extracted text (empty string on failure)
+    raw_bytes — raw PDF bytes (None on failure), used for logo extraction
+    """
     if not pdf_url or not pdf_url.startswith("http"):
-        return ""
+        return "", None
     try:
         resp = requests.get(pdf_url, headers=HEADERS, timeout=30)
         if resp.status_code != 200:
             print(f"      ✗ HTTP {resp.status_code}")
-            return ""
-        with pdfplumber.open(io.BytesIO(resp.content)) as pdf:
+            return "", None
+        raw = resp.content
+        with pdfplumber.open(io.BytesIO(raw)) as pdf:
             pages = [p.extract_text() for p in pdf.pages if p.extract_text()]
-            return "\n".join(pages)
+            text = "\n".join(pages)
+        return text, raw
     except Exception as e:
         print(f"      ✗ PDF error: {e}")
+        return "", None
+
+# =============================================================================
+#  PDF LOGO EXTRACTOR — pulls the org logo embedded in the PDF
+# =============================================================================
+
+def extract_logo_from_pdf(pdf_bytes: bytes) -> str:
+    """
+    Extract the most likely org logo from the first page of a PDF.
+
+    Strategy:
+      1. Open with PyMuPDF (fitz).
+      2. Scan page 1 (page 2 as fallback) for embedded images.
+      3. Match each image's pixel data (via get_images xref) with its
+         displayed position/size (via get_image_info bbox).
+         Matching is by xref when available; falls back to index order.
+      4. Filter to logo candidates:
+         - In the top 35% of the page
+         - Display width 20–380px, height 12–220px
+         - Not a full-page background image
+         - Pixel dimensions at least 30x10
+      5. Pick the best candidate: leftmost wins (org logo is usually left;
+         MIMU header / page-number logos are on the right).
+      6. Return as data URI: "data:image/png;base64,..."
+         (works without any external URL, stores in CSV/XLSX directly)
+
+    Returns empty string if no suitable image found.
+    """
+    if not pdf_bytes:
         return ""
+    try:
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    except Exception:
+        return ""
+
+    for page_num in range(min(2, len(doc))):
+        page    = doc[page_num]
+        page_w  = page.rect.width
+        page_h  = page.rect.height
+
+        imgs   = page.get_images(full=True)   # [{xref, smask, w, h, ...}]
+        infos  = page.get_image_info()        # [{bbox, xref?, width, height, ...}]
+
+        if not imgs:
+            continue
+
+        # Build xref→info lookup; fall back to index-order pairing
+        xref_to_info = {}
+        for info in infos:
+            x = info.get("xref")
+            if x:
+                xref_to_info[x] = info
+
+        # Pair each img entry with its display info
+        paired = []
+        for idx, img in enumerate(imgs):
+            xref = img[0]
+            info = xref_to_info.get(xref)
+            if info is None and idx < len(infos):
+                info = infos[idx]   # index-order fallback
+            if info is None:
+                continue
+            paired.append((xref, img, info))
+
+        candidates = []
+        for xref, img, info in paired:
+            bbox    = info["bbox"]
+            disp_w  = bbox[2] - bbox[0]
+            disp_h  = bbox[3] - bbox[1]
+            y_top   = bbox[1]
+            x_left  = bbox[0]
+            pct_top = y_top / page_h if page_h else 1
+
+            pix_w = img[2]
+            pix_h = img[3]
+
+            # ── Filters ───────────────────────────────────────────────────────
+            if pct_top > 0.35:                          continue  # below header area
+            if disp_w < 20  or disp_w > 380:           continue  # too narrow or too wide
+            if disp_h < 12  or disp_h > 220:           continue  # too thin or too tall
+            if pix_w  < 30  or pix_h < 10:             continue  # pixel-tiny icons
+            if disp_w > page_w * 0.85:                 continue  # full-width banner
+            if disp_h > page_h * 0.45:                 continue  # full-height image
+
+            candidates.append({
+                "xref":    xref,
+                "x_left":  x_left,
+                "y_top":   y_top,
+                "disp_w":  disp_w,
+                "disp_h":  disp_h,
+                "pct_top": pct_top,
+            })
+
+        if not candidates:
+            continue
+
+        # Prefer leftmost image in the header (org logo is almost always left)
+        best = min(candidates, key=lambda c: (c["x_left"], c["pct_top"]))
+
+        try:
+            base_img = doc.extract_image(best["xref"])
+            ext      = base_img.get("ext", "png")
+            imgdata  = base_img["image"]
+            if len(imgdata) < 100:
+                continue
+            b64 = base64.b64encode(imgdata).decode()
+            return f"data:image/{ext};base64,{b64}"
+        except Exception:
+            continue
+
+    return ""
 
 # =============================================================================
 #  WEBSITE SCRAPER — visit About page for company details
@@ -871,7 +990,7 @@ def print_extracted(record: dict, pdf_text: str):
 #  MAIN FIELD PARSER
 # =============================================================================
 
-def parse_pdf_fields(text: str, row: dict, website_cache: dict) -> dict:
+def parse_pdf_fields(text: str, pdf_bytes, row: dict, website_cache: dict) -> dict:
     """Parse all fields from PDF text + sheet row. Fills gaps from org website."""
 
     title    = s(row.get("Job Title", "")) or search_pattern(text, [
@@ -945,7 +1064,14 @@ def parse_pdf_fields(text: str, row: dict, website_cache: dict) -> dict:
     logo     = ""
     details  = ""
 
-    # ── Fill company info from website (primary source) ───────────────────────
+    # ── Extract logo from PDF first (most reliable source) ───────────────────
+    if pdf_bytes:
+        pdf_logo = extract_logo_from_pdf(pdf_bytes)
+        if pdf_logo:
+            logo = pdf_logo
+            print(f"      🖼  Logo extracted from PDF ({len(pdf_logo)} chars b64)")
+
+    # ── Fill company info from website ────────────────────────────────────────
     if website:
         cached = website_cache.get(website)
         if cached is None:
@@ -957,7 +1083,9 @@ def parse_pdf_fields(text: str, row: dict, website_cache: dict) -> dict:
             print(f"      🌐 Using cached: {website}")
 
         details   = cached.get("description", "")
-        logo      = cached.get("logo", "")
+        # Only use website logo if PDF gave nothing
+        if not logo:
+            logo = cached.get("logo", "")
         if not address:
             address  = cached.get("address", "")
         if not founded:
@@ -1000,7 +1128,7 @@ def parse_pdf_fields(text: str, row: dict, website_cache: dict) -> dict:
 
 def main():
     print("=" * 64)
-    print("  MIMU Jobs PDF Extractor v3")
+    print("  MIMU Jobs PDF Extractor v4")
     print(f"  Started : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print("=" * 64)
 
@@ -1036,7 +1164,7 @@ def main():
 
         if pdf_url and pdf_url.startswith("http"):
             print(f"      PDF : {pdf_url}")
-            pdf_text = fetch_pdf_text(pdf_url)
+            pdf_text, pdf_bytes = fetch_pdf(pdf_url)
             if pdf_text:
                 print(f"      ✓ {len(pdf_text):,} chars extracted")
                 pdf_ok += 1
@@ -1045,10 +1173,11 @@ def main():
                 pdf_skip += 1
         else:
             print(f"      ⚠ No PDF URL — sheet data only")
-            pdf_text = ""
+            pdf_text  = ""
+            pdf_bytes = None
             pdf_skip += 1
 
-        enriched = parse_pdf_fields(pdf_text, row.to_dict(), website_cache)
+        enriched = parse_pdf_fields(pdf_text, pdf_bytes, row.to_dict(), website_cache)
         print_extracted(enriched, pdf_text)
         records.append(enriched)
 
