@@ -35,11 +35,7 @@ log = logging.getLogger(__name__)
 #  CONFIG — all secrets via env vars
 # =============================================================================
 
-SHEET_CSV_URL = (
-    "https://docs.google.com/spreadsheets/d/e/"
-    "2PACX-1vS9_Zza6If2T_LT-iVvQjBTIFTeqt_OVBws70v_s3NJavT-ZosZ28qtE7xds7iS5rLmU2UbhzxWnOsY"
-    "/pub?gid=964760760&single=true&output=csv"
-)
+GOOGLE_SHEET_ID = os.environ.get("SHEET_ID", "")
 
 OUTPUT_CSV         = "mimu_jobs.csv"
 OUTPUT_XLSX        = "mimu_jobs.xlsx"
