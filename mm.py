@@ -1,3 +1,28 @@
+"""
+MIMU Jobs PDF Extractor — v5
+==============================
+New in v5 (on top of v4):
+  - Mistral paraphrasing: job titles, descriptions, company details, taglines.
+    ENABLE_PARAPHRASE=True triggers up to 4 attempts per title and 3 per paragraph,
+    with similarity gating, word-count checks, and verbose per-attempt logging.
+  - WordPress REST API posting: creates/updates job-listings and companies via
+    WP Job Manager endpoints. Uploads logos as WP Media attachments (data-URI or URL).
+  - Duplicate tracker (processed_ids.csv): records job IDs so re-runs are idempotent.
+  - All config via environment variables (WP_BASE_URL, WP_USERNAME, WP_APP_PASSWORD,
+    MISTRAL_API_KEY) — no hardcoded secrets.
+
+REQUIREMENTS:
+    pip install requests pdfplumber pymupdf pandas openpyxl beautifulsoup4 \
+                sentence-transformers language-tool-python==2.7.1 nltk
+
+USAGE:
+    export WP_BASE_URL="https://your-site.com/wp-json/wp/v2"
+    export WP_USERNAME="admin"
+    export WP_APP_PASSWORD="xxxx xxxx xxxx xxxx"
+    export MISTRAL_API_KEY="sk-..."
+    python mimu_jobs_extractor_v5.py
+"""
+
 import requests
 import pdfplumber
 import fitz          # PyMuPDF
@@ -11,8 +36,25 @@ import sys
 import math
 import hashlib
 import logging
+import warnings
 from datetime import datetime
 from bs4 import BeautifulSoup
+
+import nltk
+from sentence_transformers import SentenceTransformer, util
+import language_tool_python
+
+warnings.filterwarnings("ignore")
+
+# Download NLTK data quietly if missing
+for _resource, _name in [
+    ("tokenizers/punkt_tab", "punkt_tab"),
+    ("taggers/averaged_perceptron_tagger", "averaged_perceptron_tagger"),
+]:
+    try:
+        nltk.data.find(_resource)
+    except LookupError:
+        nltk.download(_name, quiet=True)
 
 # =============================================================================
 #  LOGGING
@@ -63,6 +105,27 @@ for _var, _val, _feature in [
 ]:
     if not _val:
         log.warning(f"Env var {_var} not set — {_feature} will be disabled/skipped.")
+
+# =============================================================================
+#  SEMANTIC SIMILARITY + GRAMMAR MODELS
+#  Loaded once at startup so every paraphrase call reuses the same instance.
+# =============================================================================
+
+print("⏳ Loading SentenceTransformer model…")
+_similarity_model = SentenceTransformer("all-MiniLM-L6-v2", device="cpu")
+print("✅ SentenceTransformer ready.")
+
+print("⏳ Loading LanguageTool grammar checker…")
+try:
+    _grammar_tool = language_tool_python.LanguageTool(
+        "en-US", remote_server="https://api.languagetool.org"
+    )
+    _GRAMMAR_ENABLED = True
+    print("✅ LanguageTool ready.")
+except Exception as _lt_err:
+    log.warning(f"LanguageTool unavailable ({_lt_err}) — grammar correction disabled.")
+    _grammar_tool    = None
+    _GRAMMAR_ENABLED = False
 
 # =============================================================================
 #  OUTPUT COLUMNS
@@ -895,29 +958,97 @@ def mistral_generate(prompt: str, max_tokens: int = 400, temperature: float = 0.
 #  TEXT HELPERS FOR PARAPHRASE
 # =============================================================================
 
-def sanitize_text(text: str) -> str:
-    """Strip HTML tags and excessive whitespace."""
-    clean = re.sub(r'<[^>]+>', ' ', text or "")
-    clean = re.sub(r'\s+', ' ', clean).strip()
-    return clean
+# Common mojibake sequences produced by mis-decoded UTF-8
+_MOJIBAKE = [
+    ("Â", ""), ("â€™", "'"), ("â€œ", '"'), ("â€\x9d", '"'), ("â€", '"'),
+    ("â€¢", "•"), ("â„¢", "™"), ("\u00a0", " "), ("\u200b", ""), ("\ufeff", ""),
+]
+
+def _fix_mojibake(text: str) -> str:
+    for pattern, replacement in _MOJIBAKE:
+        text = text.replace(pattern, replacement)
+    # Strip non-printable control characters (keep newline \n = 0x0A)
+    text = re.sub(r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]", "", text)
+    return text
+
+def sanitize_text(text: str, is_url: bool = False, is_email: bool = False) -> str:
+    """
+    Clean and normalise text before sending to Mistral or WordPress.
+    - Fixes mojibake / encoding artefacts
+    - Strips HTML tags
+    - Collapses excess whitespace
+    - Removes markdown artefacts (##, **)
+    """
+    if not isinstance(text, str):
+        text = str(text) if text is not None else ""
+    text = text.strip()
+    if text in ("nan", "None", "NaN", "", "N/A", "n/a", "NA", "na"):
+        return ""
+    text = _fix_mojibake(text)
+    # For URLs/emails: just collapse whitespace, no further stripping
+    if is_url or is_email:
+        return re.sub(r"[ \t\r\n\f\v]+", " ", text).strip()
+    # Strip HTML tags
+    text = re.sub(r"<[^>]+>", " ", text)
+    # Remove markdown artefacts
+    text = re.sub(r"#+\s*", "", text)
+    text = re.sub(r"\*\*", "", text)
+    # Keep only printable Latin + extended Latin + common punctuation
+    text = re.sub(
+        r"[^\x20-\x7E\n\u00C0-\u017F\u2013\u2014\u2018-\u201D\u2022]", "", text
+    )
+    text = re.sub(r"[ \t]+", " ", text)
+    return re.sub(r"\n{3,}", "\n\n", text).strip()
+
+def _grammar_correct(text: str) -> str:
+    """Apply LanguageTool grammar correction if available."""
+    if not _GRAMMAR_ENABLED or not _grammar_tool:
+        return text
+    try:
+        return language_tool_python.utils.correct(text, _grammar_tool.check(text))
+    except Exception:
+        return text
 
 def clean_output(raw: str) -> str:
-    """Strip markdown fences, leading labels, extra whitespace."""
+    """
+    Strip model artefacts from Mistral output, fix encoding, apply grammar correction.
+    Handles: markdown fences, [INST] tags, leading labels, excess whitespace.
+    """
     if not raw:
         return ""
-    raw = re.sub(r'```[a-z]*', '', raw).replace('```', '')
-    raw = re.sub(r'^(?:rewritten?|paraphrased?|output)[:\s]+', '', raw, flags=re.IGNORECASE)
-    return raw.strip()
+    raw = _fix_mojibake(raw)
+    # Remove markdown code fences
+    raw = re.sub(r"```[a-z]*", "", raw).replace("```", "")
+    # Remove model instruction tags
+    raw = re.sub(r"\[/?INST\]|</?s>", "", raw)
+    # Strip leading "Rewritten:", "Output:", etc.
+    raw = re.sub(
+        r"^(?:rewritten?|rephrased?|output|paraphrase[d]?)[:\s]+",
+        "", raw, flags=re.IGNORECASE,
+    )
+    # Strip markdown bold / headers / dividers
+    raw = re.sub(r"\*\*|###|---", "", raw)
+    raw = re.sub(r"[ \t]+", " ", raw)
+    raw = re.sub(r"\n{3,}", "\n\n", raw)
+    return _grammar_correct(raw.strip())
 
 def similarity_score(a: str, b: str) -> float:
-    """Jaccard similarity on word sets (case-insensitive)."""
+    """
+    Semantic cosine similarity via SentenceTransformer embeddings.
+    Returns a float in [0, 1].  Falls back to 0.0 on any error.
+    """
     if not a or not b:
         return 0.0
-    sa = set(a.lower().split())
-    sb = set(b.lower().split())
-    if not sa or not sb:
-        return 0.0
-    return len(sa & sb) / len(sa | sb)
+    try:
+        embeddings = _similarity_model.encode([a, b], convert_to_tensor=True)
+        return float(util.pytorch_cos_sim(embeddings[0], embeddings[1]))
+    except Exception:
+        # Ultimate fallback: Jaccard on word sets
+        sa = set(a.lower().split())
+        sb = set(b.lower().split())
+        if not sa or not sb:
+            return 0.0
+        return len(sa & sb) / len(sa | sb)
 
 def _print_wrapped(text: str, prefix: str = "   ", width: int = 100):
     words = text.split()
@@ -1151,7 +1282,7 @@ def paraphrase_tagline(text: str) -> str:
     wc     = len(result.split()) if result else 0
 
     print(f" │ Paraphrased : \"{result}\"")
-    print(f" │ Words: {wc}")
+    print(f" │ Words: {wc} | Similarity: {similarity_score(clean, result) if result else 0.0:.3f}")
 
     if result and 3 <= wc <= 15:
         print(f" │ → ✅ ACCEPTED")
