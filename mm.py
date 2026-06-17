@@ -47,8 +47,7 @@ OUTPUT_XLSX        = "mimu_jobs.xlsx"
 PROCESSED_IDS_FILE = "processed_ids.csv"
 
 # ── WordPress ─────────────────────────────────────────────────────────────────
-WP_URL      = os.environ.get("WP_BASE_URL", "")   # e.g. https://myanmar.mimusjobs.com/wp-json/wp/v2
-WP_USER     = os.environ.get("WP_USERNAME", "")
+WP_URL      = os.environ.get("WP_BASE_URL", "")   # 
 WP_PASSWORD = os.environ.get("WP_APP_PASSWORD", "")
 WP_BASE        = WP_URL.rstrip("/")
 WP_JOBS_URL    = f"{WP_BASE}/job-listings"
