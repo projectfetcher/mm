@@ -1,11 +1,15 @@
 """
-MIMU Jobs PDF Extractor — Full Version
-=======================================
-- Reads PDF URLs from published Google Sheet CSV
-- Downloads & extracts full PDF text
-- Standardised Job Field / Qualification / Experience bands
-- Visits org website to fill missing company info + logo
-- Saves mimu_jobs.csv + mimu_jobs.xlsx
+MIMU Jobs PDF Extractor — v2 (Fixed)
+======================================
+Fixes applied vs v1:
+  - Job Type: tighter keyword matching (no false "Internship" hits)
+  - Job Qualifications: strict tier-map only, empty if no match
+  - Job Experience: strict band-map only, empty if no match
+  - Salary: strip prose, keep only numeric/currency amounts
+  - Company Address: strict address-pattern only, blank if none found
+  - Company Details: fetched from company website About page (not PDF)
+  - Job Description: fuller extraction (up to 1500 chars, more sections)
+  - Website scraper: improved About-page discovery
 
 REQUIREMENTS:
     pip install requests pdfplumber pandas openpyxl beautifulsoup4
@@ -55,12 +59,12 @@ HEADERS = {
     "Accept-Language": "en-US,en;q=0.5",
 }
 
-# Skip these domains when looking for org websites
+# Domains that are ATS/application platforms, not org websites
 APP_PLATFORM_DOMAINS = [
     'smrtr.io', 'workday', 'myworkday', 'bamboohr', 'greenhouse.io',
     'lever.co', 'forms.office', 'google.com/forms', 'hr-manager',
-    'smartrecruiters', 'jobs.', 'careers.', 'themimu.info',
-    'candidate.', 'apply.', 'recruiting.',
+    'smartrecruiters', 'themimu.info', 'candidate.', 'apply.',
+    'recruiting.', 'jobs.tdh.org', 'theirc.wd1', 'worldvision.wd1',
 ]
 
 # =============================================================================
@@ -79,7 +83,7 @@ FIELD_KEYWORD_MAP = [
      ["accountant","auditor","finance manager","financial analyst","cfo","treasurer","tax",
       "bookkeeper","payroll","budget analyst","credit analyst","investment","portfolio manager",
       "risk analyst","actuary","acca","cfa","cpa","finance officer","grants officer",
-      "budget officer","financial management"],
+      "budget officer","financial management","head, finance","head of finance"],
      ["financial","accounting","balance sheet","p&l","reconciliation","ifrs","gaap",
       "ledger","invoicing","grants","budget","donor funds"]),
 
@@ -92,15 +96,15 @@ FIELD_KEYWORD_MAP = [
     ("Marketing & Communications",
      ["marketing manager","digital marketing","seo","sem","content marketer","social media manager",
       "brand manager","marketing executive","communications manager","pr manager","copywriter",
-      "growth hacker","email marketing","campaign manager","communications officer"],
+      "growth hacker","email marketing","campaign manager","communications officer","gedsi"],
      ["marketing","branding","advertising","social media","content","campaign","analytics",
-      "google ads","facebook ads","influencer","public relations"]),
+      "google ads","facebook ads","influencer","public relations","gender equality"]),
 
     ("Human Resources",
      ["hr manager","human resources","recruiter","talent acquisition","hr business partner",
       "hrbp","hr officer","compensation","benefits manager","organisational development",
       "learning and development","l&d","hr generalist","payroll manager","hr coordinator",
-      "hr assistant","hr & admin"],
+      "hr assistant","hr & admin","hr and admin"],
      ["recruitment","onboarding","performance management","employee relations","hr","workforce",
       "personnel","staffing","hiring"]),
 
@@ -110,16 +114,18 @@ FIELD_KEYWORD_MAP = [
       "occupational therapist","dentist","midwife","health officer","nurse counsellor",
       "medical assistant","community health","health specialist","nutrition specialist",
       "x-ray technician","cxr technician","health and nutrition","wash officer",
-      "wash expert","emergency wash","foot unit worker","domestic health"],
+      "wash expert","emergency wash","foot unit worker","domestic health",
+      "team leader","community mobilizer","demand generator","program coordinator"],
      ["hospital","clinic","patient","medical","health","pharmaceutical","diagnosis","treatment",
-      "tb","hiv","malaria","nutrition","wash","sanitation","hygiene","epidemic"]),
+      "tb","hiv","malaria","nutrition","wash","sanitation","hygiene","epidemic",
+      "reproductive health","harm reduction","community health"]),
 
     ("Protection & Social Work",
      ["protection officer","protection assistant","gbv officer","social worker","case manager",
       "community mobilizer","community development officer","welfare officer","safeguarding",
-      "child protection"],
+      "child protection","field officer"],
      ["protection","gbv","gender","child protection","safeguarding","community","welfare",
-      "beneficiary","case management","psychosocial"]),
+      "beneficiary","case management","psychosocial","displacement","idp"]),
 
     ("Education & Training",
      ["teacher","lecturer","professor","trainer","educator","tutor","school principal",
@@ -149,7 +155,7 @@ FIELD_KEYWORD_MAP = [
       "personal assistant","receptionist","data entry","office administrator","admin officer",
       "company secretary","admin and finance","admin coordinator","housekeeper","office assistant",
       "program coordinator","programme coordinator","programme manager","project coordinator",
-      "project officer","field officer","project support","branch manager"],
+      "project officer","field officer","project support","branch manager","admin and hr"],
      ["administration","operations","office","coordination","scheduling","reporting","clerical",
       "planning","implementation","monitoring","reporting"]),
 
@@ -161,7 +167,8 @@ FIELD_KEYWORD_MAP = [
     ("Research & Data",
      ["research scientist","data scientist","lab researcher","research analyst",
       "clinical researcher","environmental scientist","chemist","biologist","statistician",
-      "data analyst","data assistant","m&e","monitoring and evaluation","data analytics"],
+      "data analyst","data assistant","m&e","monitoring and evaluation","data analytics",
+      "assistant m&e manager"],
      ["research","analysis","data","laboratory","science","experiment","findings","methodology",
       "monitoring","evaluation","indicators","log frame","data collection"]),
 
@@ -190,7 +197,7 @@ def infer_job_field(title: str, description: str) -> str:
     return best_field if best_score >= 2 else "Other"
 
 # =============================================================================
-#  STANDARDISED QUALIFICATIONS
+#  STANDARDISED QUALIFICATIONS — strict mapping only
 # =============================================================================
 
 QUALIFICATION_TIERS = [
@@ -201,7 +208,8 @@ QUALIFICATION_TIERS = [
       "post-graduate","post graduate","master of"]),
     ("Bachelor's Degree",
      ["bachelor","bsc","b.sc","b.a ","beng","b.eng","bcom","b.com","bba","llb",
-      "degree in","undergraduate","honours","hons","b.med","mbbs","m.b.,b.s"]),
+      "degree in","undergraduate","honours","hons","b.med","mbbs","m.b.,b.s",
+      "b.med.tech","any graduate","be a graduate","be graduate"]),
     ("Higher National Diploma",
      ["hnd","hnc","higher national diploma","higher national certificate",
       "higher diploma","advanced diploma"]),
@@ -211,17 +219,19 @@ QUALIFICATION_TIERS = [
      ["acca","cpa","cfa","cima","pmp","prince2","cissp","aws certified","comptia",
       "cisco","ccna","ccnp","shrm","cipd","chartered","certified public",
       "certified financial","certified project","professional certification",
-      "professional certificate","b.med.tech"]),
+      "professional certificate"]),
     ("A-Levels / High School",
      ["a-level","a level","hsc","higher school certificate","ib diploma",
-      "international baccalaureate","gce advanced","high school","secondary school"]),
+      "international baccalaureate","gce advanced","high school","secondary school",
+      "matric","matriculation","grade 10","grade 12","tenth standard","passed 10"]),
     ("No Formal Qualification Required",
      ["no qualification","no degree","no formal","school leaver","entry level",
       "no experience required","training provided","will train","primary school",
-      "minimum high school"]),
+      "minimum high school","any education"]),
 ]
 
 def extract_qualification(text: str) -> str:
+    """Return standard tier label or empty string — never raw prose."""
     if not text:
         return ""
     lower = text.lower()
@@ -231,7 +241,7 @@ def extract_qualification(text: str) -> str:
     return ""
 
 # =============================================================================
-#  STANDARDISED EXPERIENCE
+#  STANDARDISED EXPERIENCE — strict band-map only
 # =============================================================================
 
 NO_EXP_KW = [
@@ -241,7 +251,7 @@ NO_EXP_KW = [
 ]
 LESS1_KW = [
     "less than 1 year","under 1 year","6 months","less than a year",
-    "some experience","minimal experience",
+    "some experience","minimal experience","at least 6",
 ]
 
 def years_to_band(n: int) -> str:
@@ -252,6 +262,7 @@ def years_to_band(n: int) -> str:
     return "10+ Years"
 
 def extract_experience(text: str) -> str:
+    """Return standard band or empty string — never raw prose."""
     if not text:
         return ""
     lower = text.lower()
@@ -265,6 +276,7 @@ def extract_experience(text: str) -> str:
         r"(?:minimum|at\s+least|over|more\s+than)\s+(\d+)\s*\+?\s*years?",
         r"(\d+)\s*years?\s*(?:of\s+)?(?:relevant\s+)?(?:work\s+)?experience",
         r"experience\s*(?:of\s+)?(\d+)\s*years?",
+        r"(\d+)\s*years?\s*(?:in|of)",
     ]
     for p in patterns:
         m = re.search(p, text, re.IGNORECASE)
@@ -275,22 +287,87 @@ def extract_experience(text: str) -> str:
     return ""
 
 # =============================================================================
-#  STANDARDISED JOB TYPE
+#  STANDARDISED JOB TYPE — tighter matching
 # =============================================================================
 
 def detect_job_type(text: str, title: str) -> str:
     combined = (text + " " + title).lower()
-    if any(k in combined for k in ["intern", "internship"]):
+    # Internship must be explicit — don't match "intern" inside other words
+    if re.search(r'\bintern\b|\binternship\b', combined):
         return "Internship"
-    if any(k in combined for k in ["part-time", "part time"]):
+    if re.search(r'\bpart[-\s]time\b', combined):
         return "Part-time"
-    if any(k in combined for k in ["volunteer"]):
+    if re.search(r'\bvolunteer\b', combined):
         return "Volunteer"
-    if any(k in combined for k in ["consultant", "consultancy", "terms of reference", "tor "]):
+    if re.search(r'\bconsultant\b|\bconsultancy\b|\bterms of reference\b|\btor\b|\bservice provider\b|\brfa\b|\brfp\b', combined):
         return "Consultancy / Contract"
-    if any(k in combined for k in ["contract", "fixed-term", "fixed term", "temporary", "service agreement"]):
+    if re.search(r'\bcontract\b|\bfixed[-\s]term\b|\btemporary\b|\bservice agreement\b', combined):
         return "Consultancy / Contract"
     return "Full-time"
+
+# =============================================================================
+#  SALARY — extract numeric/currency amounts only
+# =============================================================================
+
+CURRENCY_PATTERNS = [
+    # USD / GBP / EUR explicit
+    r'USD\s*[\d,]+(?:\s*[-–]\s*[\d,]+)?(?:\s*/\s*\w+)?',
+    r'GBP\s*[\d,]+(?:\s*[-–]\s*[\d,]+)?(?:\s*/\s*\w+)?',
+    r'EUR\s*[\d,]+(?:\s*[-–]\s*[\d,]+)?(?:\s*/\s*\w+)?',
+    r'\$\s*[\d,]+(?:\s*[-–]\s*\$?\s*[\d,]+)?(?:\s*/\s*\w+)?',
+    r'£\s*[\d,]+(?:\s*[-–]\s*£?\s*[\d,]+)?(?:\s*/\s*\w+)?',
+    # MMK / Kyat
+    r'[\d,]+(?:\s*[-–]\s*[\d,]+)?\s*(?:MMK|Ks\.?|Kyats?)\b',
+    r'MMK\s*[\d,]+(?:\s*[-–]\s*[\d,]+)?',
+    # Range with "per month / year"
+    r'[\d,]+(?:\s*[-–]\s*[\d,]+)?\s*/\s*(?:month|year|day|hour)',
+    # Consultancy fee
+    r'(?:fee|total fee)\s+(?:of\s+)?(?:USD|GBP|EUR|\$|£)?\s*[\d,]+',
+]
+
+def extract_salary(text: str, sheet_salary: str) -> str:
+    """Return only numeric/currency amounts, never prose sentences."""
+    for src in [text[:3000], sheet_salary]:
+        if not src:
+            continue
+        for pat in CURRENCY_PATTERNS:
+            m = re.search(pat, src, re.IGNORECASE)
+            if m:
+                val = m.group(0).strip().rstrip('.,')
+                # Sanity: must contain a digit
+                if re.search(r'\d', val):
+                    return val
+    return ""
+
+# =============================================================================
+#  COMPANY ADDRESS — strict address patterns only
+# =============================================================================
+
+ADDRESS_PATTERNS = [
+    # "No. X, Street Name, Township, City"
+    r'No\.?\s*\(?[A-Z0-9\-]+\)?\s*[,\s]+[^\n,]{5,80}(?:Street|Road|Avenue|Lane|Quarter|Ward)[^\n,]{0,60}',
+    # Numbered street address
+    r'\b\d+[,\s]+[A-Z][^\n,]{10,80}(?:Street|Road|Avenue|Lane|Township|Yangon|Mandalay|Myanmar)[^\n,]{0,60}',
+    # "Address: ..." line
+    r'(?:address|office address|our office|located at|head office)[:\s]+([A-Z0-9#][^\n]{15,150})',
+    # Ward / Township patterns
+    r'(?:Ward|Township)\s+(?:No\.?\s*)?\(?[\w\s\-]+\)?\s*[,\s]+[^\n]{10,80}(?:Yangon|Mandalay|Myanmar|Township)',
+]
+
+def extract_address(text: str) -> str:
+    """Return address-formatted string or empty — never sentences."""
+    if not text:
+        return ""
+    for pat in ADDRESS_PATTERNS:
+        m = re.search(pat, text, re.IGNORECASE)
+        if m:
+            val = (m.group(1) if m.lastindex else m.group(0)).strip().strip('.,')
+            # Must look like an address (has digit or known geo word)
+            if re.search(r'\d|Yangon|Mandalay|Township|Myanmar|Street|Road', val, re.IGNORECASE):
+                # Reject if it's clearly a sentence (>200 chars or has verb-like words)
+                if len(val) < 200 and not re.search(r'\b(?:please|ensure|must|will|should|have|been|with)\b', val, re.IGNORECASE):
+                    return val
+    return ""
 
 # =============================================================================
 #  COMPANY TYPE
@@ -298,15 +375,15 @@ def detect_job_type(text: str, title: str) -> str:
 
 def detect_company_type(text: str) -> str:
     tl = text.lower()
-    if re.search(r'\bngo\b|non.governmental|nonprofit|non-profit', tl):
-        return "NGO / Non-Profit"
-    if re.search(r'\bundp\b|\bunicef\b|\bwfp\b|\bunhcr\b|\bwho\b|\bilo\b|united nations|un agency|\bioм\b|\biom\b|\bunesco\b', tl):
+    if re.search(r'\bundp\b|\bunicef\b|\bwfp\b|\bunhcr\b|\bwho\b|\bilo\b|united nations|un agency|\biom\b|\bunesco\b|\bundss\b', tl):
         return "UN Agency"
+    if re.search(r'\bingo\b|international ngo|international non-governmental', tl):
+        return "INGO"
+    if re.search(r'\bngo\b|non.governmental|nonprofit|non-profit|non governmental', tl):
+        return "NGO / Non-Profit"
     if re.search(r'\bgovernment\b|ministry of|department of|\bgovernmental\b', tl):
         return "Government"
-    if re.search(r'\bingo\b|international ngо|international non', tl):
-        return "INGO"
-    if re.search(r'\bprivate\b|\bltd\b|\blimited\b|\bcorporation\b|\binc\b|\bplc\b', tl):
+    if re.search(r'\bprivate\b|\bltd\b|\blimited\b|\bcorporation\b|\binc\b|\bplc\b|\bco\.\b', tl):
         return "Private Sector"
     return ""
 
@@ -325,9 +402,9 @@ def s(val) -> str:
 #  HTTP HELPERS
 # =============================================================================
 
-def get_html(url: str, timeout: int = 12) -> str:
+def get_html(url: str, timeout: int = 15) -> str:
     try:
-        resp = requests.get(url, headers=HEADERS, timeout=timeout)
+        resp = requests.get(url, headers=HEADERS, timeout=timeout, allow_redirects=True)
         if resp.status_code == 200:
             return resp.text
     except Exception:
@@ -350,18 +427,67 @@ def fetch_pdf_text(pdf_url: str) -> str:
         return ""
 
 # =============================================================================
-#  WEBSITE SCRAPER — fills missing company fields
+#  WEBSITE SCRAPER — visit About page for company details
 # =============================================================================
+
+ABOUT_SLUGS = [
+    "/about", "/about-us", "/about_us", "/who-we-are", "/our-story",
+    "/organisation", "/organization", "/mission", "/overview",
+    "/about/who-we-are", "/en/about", "/en/about-us",
+]
+
+def get_about_text(base_url: str, soup: BeautifulSoup, html: str) -> str:
+    """Try to find a rich about/mission paragraph from homepage or about page."""
+    # 1. Look for about section on homepage
+    for tag in soup.find_all(["section", "div", "article"], limit=60):
+        cid  = " ".join(tag.get("class", [])) + " " + str(tag.get("id", ""))
+        if re.search(r'about|mission|vision|who.we.are|our.story|overview', cid, re.IGNORECASE):
+            txt = tag.get_text(" ", strip=True)
+            if len(txt) > 100:
+                return txt[:1000]
+
+    # 2. Meta description
+    meta = soup.find("meta", attrs={"name": "description"}) or \
+           soup.find("meta", property="og:description")
+    if meta and meta.get("content") and len(meta["content"]) > 60:
+        meta_desc = meta["content"][:800]
+    else:
+        meta_desc = ""
+
+    # 3. Try /about page
+    for slug in ABOUT_SLUGS:
+        about_url = base_url.rstrip("/") + slug
+        about_html = get_html(about_url, timeout=12)
+        if not about_html:
+            continue
+        about_soup = BeautifulSoup(about_html, "html.parser")
+        # Remove nav/header/footer noise
+        for tag in about_soup.find_all(["nav", "header", "footer", "script", "style"]):
+            tag.decompose()
+        # Grab first large text block
+        for tag in about_soup.find_all(["p", "div", "section"], limit=80):
+            txt = tag.get_text(" ", strip=True)
+            if len(txt) > 120 and re.search(
+                r'mission|vision|about|who we are|established|founded|our work|we are|organisation|organization',
+                txt, re.IGNORECASE
+            ):
+                return txt[:1000]
+        # Fallback: longest paragraph
+        paras = [t.get_text(" ", strip=True) for t in about_soup.find_all("p")]
+        paras = [p for p in paras if len(p) > 80]
+        if paras:
+            return sorted(paras, key=len, reverse=True)[0][:1000]
+
+    return meta_desc
 
 def scrape_website(url: str) -> dict:
     """
     Visit the org website and extract:
-      - description / about text
+      - description / about text (from about page)
       - logo URL
       - founded year
       - address
       - company type hints
-    Returns a dict with keys: description, logo, founded, address, company_type
     """
     result = {"description": "", "logo": "", "founded": "", "address": "", "company_type": ""}
     if not url or not url.startswith("http"):
@@ -377,11 +503,9 @@ def scrape_website(url: str) -> dict:
 
     # ── Logo ──────────────────────────────────────────────────────────────────
     logo = ""
-    # 1. OpenGraph image
     og = soup.find("meta", property="og:image") or soup.find("meta", attrs={"name": "og:image"})
     if og and og.get("content"):
         logo = og["content"]
-    # 2. img with "logo" in class/id/src/alt
     if not logo:
         for img in soup.find_all("img"):
             src = img.get("src", "")
@@ -391,13 +515,10 @@ def scrape_website(url: str) -> dict:
             if re.search(r'logo|brand|emblem', src + alt + cls + iid, re.IGNORECASE):
                 logo = src
                 break
-    # 3. Favicon as fallback
     if not logo:
         icon = soup.find("link", rel=lambda r: r and "icon" in " ".join(r).lower())
         if icon and icon.get("href"):
             logo = icon["href"]
-
-    # Resolve relative logo URL
     if logo:
         if logo.startswith("//"):
             logo = "https:" + logo
@@ -407,22 +528,8 @@ def scrape_website(url: str) -> dict:
             logo = base_url + "/" + logo
     result["logo"] = logo
 
-    # ── Description / About ───────────────────────────────────────────────────
-    # Try meta description first
-    meta_desc = soup.find("meta", attrs={"name": "description"}) or \
-                soup.find("meta", property="og:description")
-    if meta_desc and meta_desc.get("content") and len(meta_desc["content"]) > 30:
-        result["description"] = meta_desc["content"][:500]
-    else:
-        # Look for about/mission sections
-        for tag in soup.find_all(["p", "div", "section"], limit=50):
-            txt = tag.get_text(" ", strip=True)
-            if len(txt) > 80 and re.search(
-                r'mission|vision|about us|who we are|established|founded|our work|we are',
-                txt, re.IGNORECASE
-            ):
-                result["description"] = txt[:500]
-                break
+    # ── About / Description — from About page ─────────────────────────────────
+    result["description"] = get_about_text(base_url, soup, html)
 
     # ── Founded year ──────────────────────────────────────────────────────────
     text_body = soup.get_text(" ")
@@ -432,18 +539,10 @@ def scrape_website(url: str) -> dict:
         if 1900 <= year <= datetime.now().year:
             result["founded"] = m.group(1)
 
-    # ── Address ───────────────────────────────────────────────────────────────
-    for pat in [
-        r'(No\.?\s*\d+[^\n,]{5,60}(?:Street|Road|Avenue|Lane|Township|Yangon|Mandalay|Myanmar)[^\n,]{0,50})',
-        r'(\d+[,\s]+[A-Z][^\n]{15,100}(?:Street|Road|Township|Yangon|Myanmar))',
-        r'(?:address|located at|office)[:\s]+([^\n]{15,150})',
-    ]:
-        m2 = re.search(pat, text_body, re.IGNORECASE)
-        if m2:
-            result["address"] = m2.group(1).strip()
-            break
+    # ── Address — strict patterns only ────────────────────────────────────────
+    result["address"] = extract_address(text_body)
 
-    # ── Company type hints ────────────────────────────────────────────────────
+    # ── Company type ──────────────────────────────────────────────────────────
     result["company_type"] = detect_company_type(text_body)
 
     return result
@@ -459,7 +558,8 @@ def search_pattern(text: str, patterns: list) -> str:
             return m.group(1).strip(" :.,\t-")
     return ""
 
-def search_block(text: str, header_patterns: list, max_lines: int = 8) -> str:
+def search_block(text: str, header_patterns: list, max_lines: int = 20) -> str:
+    """Extract a block of text following a section header."""
     lines = text.split("\n")
     for i, line in enumerate(lines):
         for pat in header_patterns:
@@ -469,7 +569,10 @@ def search_block(text: str, header_patterns: list, max_lines: int = 8) -> str:
                     l = lines[j].strip()
                     if not l:
                         continue
-                    if re.match(r'^[A-Z][A-Z\s]{4,}:?\s*$', l) or (l.endswith(":") and len(l) < 50):
+                    # Stop at next section header
+                    if re.match(r'^[A-Z][A-Z\s/&]{4,}:?\s*$', l) and len(l) < 60:
+                        break
+                    if l.endswith(":") and len(l) < 50 and l == l.upper():
                         break
                     block.append(l)
                 if block:
@@ -487,22 +590,19 @@ def extract_emails(text: str) -> str:
 
 def extract_apply_url(text: str) -> str:
     urls = re.findall(r'https?://[^\s\'"<>)]+', text)
-    # Prefer known ATS / apply links
     for url in urls:
         u = url.rstrip('.,)')
-        if re.search(r'apply|career|recruit|workday|bamboo|greenhouse|lever|smartrecruiters|smrtr|hr-manager|myworkday', u, re.IGNORECASE):
+        if re.search(r'apply|career|recruit|workday|bamboo|greenhouse|lever|smartrecruiters|smrtr|hr-manager|myworkday|forms\.office|tdh\.org/en-GB', u, re.IGNORECASE):
             return u
     return ""
 
 def extract_application(text: str, existing: str) -> str:
-    # 1. Good existing URL
     if existing and existing.startswith("http") and not existing.endswith("/"):
-        if re.search(r'apply|career|recruit|workday|bamboo|smrtr|hr-manager|myworkday|forms', existing, re.IGNORECASE):
+        if re.search(r'apply|career|recruit|workday|bamboo|smrtr|hr-manager|myworkday|forms|tdh\.org', existing, re.IGNORECASE):
             return existing
 
     decoded = text.replace("%40", "@").replace("%2E", ".").replace("%2F", "/")
 
-    # 2. Email near application instructions
     app_section = ""
     for pat in [
         r'(?:to apply|how to apply|application process|submit|send cv|send resume)[^\n]{0,300}',
@@ -518,12 +618,10 @@ def extract_application(text: str, existing: str) -> str:
     if email:
         return email
 
-    # 3. ATS / apply URL
     url = extract_apply_url(app_section) or extract_apply_url(decoded)
     if url:
         return url
 
-    # 4. Any existing value decoded
     if existing:
         decoded_ex = existing.replace("%40", "@").replace("%2E", ".").replace("%2F", "/").lstrip("/")
         if "@" in decoded_ex or decoded_ex.startswith("http"):
@@ -532,51 +630,93 @@ def extract_application(text: str, existing: str) -> str:
     return ""
 
 def extract_website(text: str, existing: str) -> str:
+    """Find the org's own website, not an ATS platform."""
     urls = re.findall(r'https?://[^\s\'"<>)]+', text)
     candidates = []
     for url in urls:
         u = url.rstrip('.,)')
         if not any(d in u for d in APP_PLATFORM_DOMAINS):
             candidates.append(u)
-    # Prefer short-path (homepage) URLs
     for url in candidates:
         path = re.sub(r'https?://[^/]+', '', url)
         if len(path) < 25:
             return url
     if candidates:
         return candidates[0]
-    return s(existing)
-
-def extract_address_from_text(text: str) -> str:
-    for pat in [
-        r'(?:address|office location|our office)[:\s]+([^\n]{15,150})',
-        r'(?:located at|based at|head office)[:\s]+([^\n]{15,150})',
-        r'(No\.?\s*\d+[^\n,]{5,60}(?:Street|Road|Avenue|Lane|Township|Yangon|Mandalay|Myanmar)[^\n,]{0,50})',
-        r'(\d+[,\s]+[A-Z][^\n]{15,100}(?:Street|Road|Township|Yangon|Myanmar))',
-    ]:
-        m = re.search(pat, text, re.IGNORECASE)
-        if m:
-            return m.group(1).strip()
+    # Fall back to existing if it's not an ATS platform
+    ex = s(existing)
+    if ex and not any(d in ex for d in APP_PLATFORM_DOMAINS):
+        return ex
     return ""
 
+# =============================================================================
+#  FULL JOB DESCRIPTION EXTRACTOR
+# =============================================================================
+
+DESCRIPTION_HEADERS = [
+    r'key responsibilit', r'main responsibilit', r'responsibilit',
+    r'duties and responsibilit', r'key tasks', r'scope of work',
+    r'main duties', r'job purpose', r'objective', r'role summary',
+    r'key deliverables', r'position summary', r'job summary',
+    r'about the role', r'role description', r'what you will do',
+    r'your role', r'the role', r'tasks and responsibilit',
+    r'description of duties', r'overview of the role',
+]
+
+def extract_description(text: str, sheet_desc: str) -> str:
+    """Extract a full, rich job description (up to 1500 chars)."""
+    # Try each header — pick the longest block found
+    best = ""
+    lines = text.split("\n")
+    for i, line in enumerate(lines):
+        for pat in DESCRIPTION_HEADERS:
+            if re.search(pat, line, re.IGNORECASE):
+                block_lines = []
+                for j in range(i + 1, min(i + 35, len(lines))):
+                    l = lines[j].strip()
+                    if not l:
+                        continue
+                    # Stop at next ALL-CAPS section header
+                    if re.match(r'^[A-Z][A-Z\s/&]{5,}:?\s*$', l) and len(l) < 70:
+                        break
+                    block_lines.append(l)
+                candidate = " ".join(block_lines)
+                if len(candidate) > len(best):
+                    best = candidate
+
+    if best and len(best) > 100:
+        return best[:1500]
+
+    # Fallback: gather all bullet-point lines (• ❖ - *)
+    bullets = []
+    for line in lines:
+        stripped = line.strip()
+        if stripped and re.match(r'^[•❖\-\*►▪]', stripped) and len(stripped) > 20:
+            bullets.append(stripped)
+    if bullets:
+        return " ".join(bullets[:25])[:1500]
+
+    # Last fallback: long sentences
+    long_lines = [l.strip() for l in lines if len(l.strip()) > 60]
+    candidate = " ".join(long_lines[:15])
+    if candidate:
+        return candidate[:1500]
+
+    return s(sheet_desc)[:1500]
+
+# =============================================================================
+#  COMPANY FOUNDED EXTRACTOR
+# =============================================================================
+
 def detect_company_founded(text: str) -> str:
-    m = re.search(r'(?:established|founded|since|incorporated)\s+(?:in\s+)?(\d{4})', text, re.IGNORECASE)
+    m = re.search(
+        r'(?:established|founded|since|incorporated|organisation\s+in|organization\s+in)\s+(?:in\s+)?(\d{4})',
+        text, re.IGNORECASE
+    )
     if m:
         year = int(m.group(1))
         if 1900 <= year <= datetime.now().year:
             return m.group(1)
-    return ""
-
-def extract_company_details(text: str, org: str) -> str:
-    org_esc = re.escape(org[:15]) if org else ""
-    pats = []
-    if org_esc:
-        pats += [rf'about\s+{org_esc}', rf'{org_esc}[^\n]{{0,30}}\nis\s+(?:a|an|the)']
-    pats += [r'about us', r'background', r'who we are', r'organization overview',
-             r'about the organization', r'introduction']
-    block = search_block(text, pats, 10)
-    if block and len(block) > 40:
-        return block[:500]
     return ""
 
 # =============================================================================
@@ -585,7 +725,7 @@ def extract_company_details(text: str, org: str) -> str:
 
 def print_extracted(record: dict, pdf_text: str):
     pad = "      "
-    div = pad + "-" * 58
+    div = pad + "-" * 60
     print(div)
     show = [
         ("Job Title", 70), ("Job Type", 25), ("Job Field", 35),
@@ -604,7 +744,7 @@ def print_extracted(record: dict, pdf_text: str):
     for field in ("Job Description", "Company Details"):
         val = record.get(field, "")
         if val:
-            print(f"{pad}{(field+':').ljust(22)} {val[:160]}{'…' if len(val)>160 else ''}")
+            print(f"{pad}{(field+':').ljust(22)} {val[:200]}{'…' if len(val)>200 else ''}")
     if pdf_text:
         snippet = " ".join(pdf_text[:500].split())
         print(f"\n{pad}--- PDF SNIPPET ---")
@@ -632,57 +772,39 @@ def parse_pdf_fields(text: str, row: dict, website_cache: dict) -> dict:
         r'submit (?:by|before)[:\s]+([^\n]{3,40})',
     ])
 
-    # ── Qualifications ────────────────────────────────────────────────────────
-    quals_raw = search_block(text, [
+    # ── Qualifications — strict tier mapping ──────────────────────────────────
+    # Search specific qualification sections first
+    quals_section = search_block(text, [
         r'qualif', r'academic requirement', r'minimum requirement',
-        r'education requirement', r'degree required',
-    ], 6)
-    if not quals_raw:
-        quals_raw = search_pattern(text, [
-            r'(?:qualifications?|educational? requirements?)[:\s]+([^\n]{10,250})',
-            r"(bachelor'?s?|master'?s?|phd|diploma|degree|b\.med|mbbs)[^\n]{0,120}",
-            r'(minimum\s+(?:diploma|degree|bachelor|high school)[^\n]{0,100})',
-        ])
-    if not quals_raw:
-        quals_raw = s(row.get("Job Qualifications", ""))
-    quals_standard = extract_qualification(quals_raw) or extract_qualification(title)
-    quals_out = quals_standard or quals_raw[:300]
-
-    # ── Experience ────────────────────────────────────────────────────────────
-    exp_raw = search_pattern(text, [
-        r'(\d+\+?\s*(?:to\s*\d+\s*)?years?\s+(?:of\s+)?(?:relevant\s+)?(?:work\s+)?experience[^\n]{0,80})',
-        r'(minimum\s+(?:of\s+)?\d+\s+years?[^\n]{0,80})',
-        r'(at least\s+\d+\s+years?[^\n]{0,80})',
-        r'experience[:\s]+([^\n]{5,100})',
+        r'education requirement', r'degree required', r'education background',
+    ], 8) or search_pattern(text, [
+        r"(bachelor'?s?|master'?s?|phd|diploma|degree|b\.med|mbbs|b\.med\.tech|m\.b\.,b\.s)[^\n]{0,180}",
+        r'(minimum\s+(?:diploma|degree|bachelor|high school)[^\n]{0,100})',
+        r'((?:any\s+)?graduate[^\n]{0,80})',
+        r'qualifications?[:\s]+([^\n]{10,200})',
     ])
-    if not exp_raw:
-        exp_raw = s(row.get("Job Experience", ""))
-    exp_out = extract_experience(exp_raw + " " + text[:2000]) or exp_raw[:200]
+    quals_standard = extract_qualification(quals_section) or extract_qualification(title)
+    # If still empty, scan full PDF text
+    if not quals_standard:
+        quals_standard = extract_qualification(text[:4000])
+    quals_out = quals_standard  # only standard label — never raw prose
 
-    # ── Description ───────────────────────────────────────────────────────────
-    desc = search_block(text, [
-        r'key responsibilit', r'main responsibilit', r'responsibilit',
-        r'duties and responsibilit', r'key tasks', r'scope of work',
-        r'main duties', r'job purpose', r'objective', r'role summary',
-        r'key deliverables',
-    ], 12)
-    if not desc:
-        long_lines = [l.strip() for l in text.split("\n") if len(l.strip()) > 50]
-        desc = " ".join(long_lines[:5])
-    if not desc:
-        desc = s(row.get("Job Description", ""))
-    desc = str(desc or "")[:600]
+    # ── Experience — strict band mapping ─────────────────────────────────────
+    exp_section = search_pattern(text, [
+        r'(\d+\+?\s*(?:to\s*\d+\s*)?years?\s+(?:of\s+)?(?:relevant\s+)?(?:work\s+)?experience[^\n]{0,100})',
+        r'(minimum\s+(?:of\s+)?\d+\s+years?[^\n]{0,100})',
+        r'(at least\s+\d+\s+years?[^\n]{0,100})',
+        r'(at least\s+\d+\s+months?[^\n]{0,80})',
+        r'experience[:\s]+([^\n]{5,120})',
+    ])
+    exp_out = extract_experience((exp_section or "") + " " + text[:3000])
+    # Only standard band — never raw prose
 
-    # ── Salary ────────────────────────────────────────────────────────────────
-    salary = search_pattern(text, [
-        r'salary[:\s]+([^\n]{5,80})',
-        r'remuneration[:\s]+([^\n]{5,80})',
-        r'compensation[:\s]+([^\n]{5,80})',
-        r'([\d,]+\s*(?:MMK|USD|Ks|Kyats?)[^\n]{0,40})',
-        r'(\$[\d,]+[^\n]{0,30})',
-        r'(competitive salary[^\n]{0,60})',
-        r'package[:\s]+([^\n]{5,60})',
-    ]) or s(row.get("Salary Range", ""))
+    # ── Description — full ────────────────────────────────────────────────────
+    desc = extract_description(text, s(row.get("Job Description", "")))
+
+    # ── Salary — numeric/currency only ────────────────────────────────────────
+    salary = extract_salary(text, s(row.get("Salary Range", "")))
 
     # ── Application ───────────────────────────────────────────────────────────
     app_out = extract_application(text, s(row.get("Application", "")))
@@ -691,46 +813,41 @@ def parse_pdf_fields(text: str, row: dict, website_cache: dict) -> dict:
     existing_web = s(row.get("Company Website", "")) or s(row.get("Company URL", ""))
     website = extract_website(text, existing_web)
 
-    # ── Address from PDF ──────────────────────────────────────────────────────
-    address = extract_address_from_text(text) or s(row.get("Company Address", ""))
-
-    # ── Company details from PDF ──────────────────────────────────────────────
-    org = s(row.get("Company Name", ""))
-    details = extract_company_details(text, org) or s(row.get("Company Details", ""))
+    # ── Job field & type ──────────────────────────────────────────────────────
+    job_field = infer_job_field(title, text[:4000])
+    job_type  = detect_job_type(text[:2000], title)
+    comp_type = detect_company_type(text[:3000]) or s(row.get("Company Type", ""))
 
     # ── Founded from PDF ──────────────────────────────────────────────────────
     founded = detect_company_founded(text)
 
-    # ── Job field & type ──────────────────────────────────────────────────────
-    job_field = infer_job_field(title, text[:3000])
-    job_type  = detect_job_type(text, title)
-    comp_type = detect_company_type(text) or s(row.get("Company Type", ""))
+    # ── Address from PDF — strict ─────────────────────────────────────────────
+    address = extract_address(text)
 
-    logo = ""
+    # ── Company info placeholders ─────────────────────────────────────────────
+    org      = s(row.get("Company Name", ""))
+    logo     = ""
+    details  = ""  # Must come from website, not PDF
 
-    # ── Fill gaps from website ────────────────────────────────────────────────
-    needs_web = (not details or len(details) < 50 or not address or
-                 not founded or not comp_type or not logo)
-
-    if website and needs_web:
+    # ── Fill ALL company info from website ─────────────────────────────────────
+    if website:
         cached = website_cache.get(website)
         if cached is None:
             print(f"      🌐 Scraping website: {website}")
             cached = scrape_website(website)
             website_cache[website] = cached
-            time.sleep(0.5)
+            time.sleep(0.8)
         else:
-            print(f"      🌐 Using cached website data")
+            print(f"      🌐 Using cached: {website}")
 
-        if not details or len(details) < 50:
-            details = cached.get("description", "") or details
+        details  = cached.get("description", "")
+        logo     = cached.get("logo", "")
         if not address:
-            address = cached.get("address", "")
+            address  = cached.get("address", "")
         if not founded:
-            founded = cached.get("founded", "")
+            founded  = cached.get("founded", "")
         if not comp_type:
             comp_type = cached.get("company_type", "")
-        logo = cached.get("logo", "")
 
     return {
         "Job Title":          str(title or ""),
@@ -751,7 +868,7 @@ def parse_pdf_fields(text: str, row: dict, website_cache: dict) -> dict:
         "Company Type":       str(comp_type or ""),
         "Company Website":    str(website or ""),
         "Company Address":    str(address or ""),
-        "Company Details":    str(details or "")[:500],
+        "Company Details":    str(details or "")[:1000],
         "Job URL":            str(s(row.get("Job URL", ""))),
         "Estimated Deadline": str(deadline or ""),
         "Salary Range":       str(salary or ""),
@@ -762,10 +879,10 @@ def parse_pdf_fields(text: str, row: dict, website_cache: dict) -> dict:
 # =============================================================================
 
 def main():
-    print("=" * 62)
-    print("  MIMU Jobs PDF Extractor")
+    print("=" * 64)
+    print("  MIMU Jobs PDF Extractor v2")
     print(f"  Started : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print("=" * 62)
+    print("=" * 64)
 
     # 1. Load sheet
     print(f"\n[1/3] Fetching Google Sheet CSV …")
@@ -785,7 +902,7 @@ def main():
     # 2. Process
     print(f"\n[2/3] Downloading PDFs and extracting fields …")
     records       = []
-    website_cache = {}   # avoid re-scraping same org site
+    website_cache = {}
     total         = len(df)
     pdf_ok        = 0
     pdf_skip      = 0
@@ -833,7 +950,7 @@ def main():
         ws.freeze_panes = "A2"
     print(f"      ✓ {OUTPUT_XLSX}")
 
-    print(f"\n{'=' * 62}")
+    print(f"\n{'=' * 64}")
     print(f"  ✅ COMPLETE")
     print(f"     Total jobs    : {total}")
     print(f"     PDF success   : {pdf_ok}")
@@ -841,7 +958,7 @@ def main():
     print(f"     Websites hit  : {len(website_cache)}")
     print(f"     Output        : {OUTPUT_CSV}, {OUTPUT_XLSX}")
     print(f"     Finished      : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print("=" * 62)
+    print("=" * 64)
 
 
 if __name__ == "__main__":
