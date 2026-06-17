@@ -1,34 +1,3 @@
-"""
-MIMU Jobs PDF Extractor — v5 (fixed)
-==============================
-Fix in this version:
-  - job_listing_type now sends integer term IDs instead of slug strings,
-    resolving the HTTP 400 "job_listing_type[0] is not of type integer" error.
-  - Added wp_get_job_type_id() helper with caching to look up term IDs
-    from the WP REST API at runtime.
-
-New in v5 (on top of v4):
-  - Mistral paraphrasing: job titles, descriptions, company details, taglines.
-    ENABLE_PARAPHRASE=True triggers up to 4 attempts per title and 3 per paragraph,
-    with similarity gating, word-count checks, and verbose per-attempt logging.
-  - WordPress REST API posting: creates/updates job-listings and companies via
-    WP Job Manager endpoints. Uploads logos as WP Media attachments (data-URI or URL).
-  - Duplicate tracker (processed_ids.csv): records job IDs so re-runs are idempotent.
-  - All config via environment variables (WP_BASE_URL, WP_USERNAME, WP_APP_PASSWORD,
-    MISTRAL_API_KEY) — no hardcoded secrets.
-
-REQUIREMENTS:
-    pip install requests pdfplumber pymupdf pandas openpyxl beautifulsoup4 \
-    language-tool-python==2.7.1
-
-USAGE:
-    export WP_BASE_URL="https://myanmar.mimusjobs.com/wp-json/wp/v2"
-    export WP_USERNAME="admin"
-    export WP_APP_PASSWORD="xxxx xxxx xxxx xxxx"
-    export MISTRAL_API_KEY="sk-..."
-    python mimu_jobs_extractor_v5.py
-"""
-
 import requests
 import pdfplumber
 import fitz          # PyMuPDF
