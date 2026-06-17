@@ -13,7 +13,7 @@ New in v5 (on top of v4):
 
 REQUIREMENTS:
     pip install requests pdfplumber pymupdf pandas openpyxl beautifulsoup4 \
-                sentence-transformers language-tool-python==2.7.1 nltk
+    language-tool-python==2.7.1
 
 USAGE:
     export WP_BASE_URL="https://your-site.com/wp-json/wp/v2"
@@ -40,21 +40,10 @@ import warnings
 from datetime import datetime
 from bs4 import BeautifulSoup
 
-import nltk
-from sentence_transformers import SentenceTransformer, util
 import language_tool_python
 
 warnings.filterwarnings("ignore")
 
-# Download NLTK data quietly if missing
-for _resource, _name in [
-    ("tokenizers/punkt_tab", "punkt_tab"),
-    ("taggers/averaged_perceptron_tagger", "averaged_perceptron_tagger"),
-]:
-    try:
-        nltk.data.find(_resource)
-    except LookupError:
-        nltk.download(_name, quiet=True)
 
 # =============================================================================
 #  LOGGING
@@ -107,13 +96,10 @@ for _var, _val, _feature in [
         log.warning(f"Env var {_var} not set — {_feature} will be disabled/skipped.")
 
 # =============================================================================
-#  SEMANTIC SIMILARITY + GRAMMAR MODELS
-#  Loaded once at startup so every paraphrase call reuses the same instance.
+#  GRAMMAR MODEL
+#  SentenceTransformer removed — similarity is computed via Mistral API instead,
+#  avoiding HuggingFace rate-limit (429) errors on GitHub Actions runners.
 # =============================================================================
-
-print("⏳ Loading SentenceTransformer model…")
-_similarity_model = SentenceTransformer("all-MiniLM-L6-v2", device="cpu")
-print("✅ SentenceTransformer ready.")
 
 print("⏳ Loading LanguageTool grammar checker…")
 try:
@@ -1034,21 +1020,32 @@ def clean_output(raw: str) -> str:
 
 def similarity_score(a: str, b: str) -> float:
     """
-    Semantic cosine similarity via SentenceTransformer embeddings.
-    Returns a float in [0, 1].  Falls back to 0.0 on any error.
+    Semantic similarity scored by Mistral (no HuggingFace download needed).
+    Asks the model to rate how semantically similar two texts are on 0-10,
+    then normalises to [0, 1].  Falls back to Jaccard on any API failure.
     """
     if not a or not b:
         return 0.0
-    try:
-        embeddings = _similarity_model.encode([a, b], convert_to_tensor=True)
-        return float(util.pytorch_cos_sim(embeddings[0], embeddings[1]))
-    except Exception:
-        # Ultimate fallback: Jaccard on word sets
+    if not MISTRAL_API_KEY:
+        # Fallback: Jaccard word overlap
         sa = set(a.lower().split())
         sb = set(b.lower().split())
-        if not sa or not sb:
-            return 0.0
-        return len(sa & sb) / len(sa | sb)
+        return len(sa & sb) / len(sa | sb) if (sa or sb) else 0.0
+    try:
+        prompt = (
+            "Rate the semantic similarity of these two texts on a scale of 0 to 10.\n"
+            "0 = completely unrelated, 10 = identical meaning.\n"
+            "Reply with ONLY a single integer (0-10), nothing else.\n\n"
+            f"Text A: {a[:300]}\n\nText B: {b[:300]}"
+        )
+        raw = mistral_generate(prompt, max_tokens=5, temperature=0.0)
+        score = float(re.search(r"\d+", raw).group()) if re.search(r"\d+", raw) else 5.0
+        return min(max(score / 10.0, 0.0), 1.0)
+    except Exception:
+        # Fallback: Jaccard word overlap
+        sa = set(a.lower().split())
+        sb = set(b.lower().split())
+        return len(sa & sb) / len(sa | sb) if (sa or sb) else 0.0
 
 def _print_wrapped(text: str, prefix: str = "   ", width: int = 100):
     words = text.split()
