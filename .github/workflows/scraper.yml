@@ -36,7 +36,7 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Run scraper
-        run: python mimu_jobs_extractor_v5.py
+        run: python mm.py
 
       - name: Upload results as artifact
         uses: actions/upload-artifact@v4
