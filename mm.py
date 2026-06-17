@@ -34,20 +34,18 @@ log = logging.getLogger(__name__)
 # =============================================================================
 #  CONFIG — all secrets via env vars
 # =============================================================================
-
 GOOGLE_SHEET_ID = os.environ.get("SHEET_ID", "")
-
 SHEET_CSV_URL = (
     f"https://docs.google.com/spreadsheets/d/e/"
     f"{GOOGLE_SHEET_ID}/pub?gid=595970725&single=true&output=csv"
 )
-
 OUTPUT_CSV         = "mimu_jobs.csv"
 OUTPUT_XLSX        = "mimu_jobs.xlsx"
 PROCESSED_IDS_FILE = "processed_ids.csv"
 
 # ── WordPress ─────────────────────────────────────────────────────────────────
-WP_URL      = os.environ.get("WP_BASE_URL", "")   # 
+WP_URL      = os.environ.get("WP_BASE_URL", "")
+WP_USER     = os.environ.get("WP_USERNAME", "")
 WP_PASSWORD = os.environ.get("WP_APP_PASSWORD", "")
 WP_BASE        = WP_URL.rstrip("/")
 WP_JOBS_URL    = f"{WP_BASE}/job-listings"
@@ -69,7 +67,6 @@ for _var, _val, _feature in [
 ]:
     if not _val:
         log.warning(f"Env var {_var} not set — {_feature} will be disabled/skipped.")
-
 # =============================================================================
 #  GRAMMAR MODEL
 # =============================================================================
