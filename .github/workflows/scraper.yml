@@ -1,58 +1,42 @@
 name: Scraper
-
 on:
   schedule:
-    - cron: '0 6 * * *'   # runs daily at 6:00 AM UTC
-  workflow_dispatch:        # also allows manual trigger from GitHub UI
-
-# Gives the auto-created GITHUB_TOKEN permission to push to the repo.
-# Without this, git push returns 403. You don't need to create this secret —
-# GitHub creates it automatically for every run.
+    - cron: '0 */2 * * *'   # runs every 2 hours
+  workflow_dispatch:
 permissions:
   contents: write
-
 jobs:
   scrape:
     runs-on: ubuntu-latest
-
     env:
       WP_BASE_URL:      ${{ secrets.WP_BASE_URL }}
       WP_USERNAME:      ${{ secrets.WP_USERNAME }}
       WP_APP_PASSWORD:  ${{ secrets.WP_APP_PASSWORD }}
       MISTRAL_API_KEY:  ${{ secrets.MISTRAL_API_KEY }}
       SHEET_ID:         ${{ secrets.SHEET_ID }}
-
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}   # uses the auto token with write access
-
+          token: ${{ secrets.GITHUB_TOKEN }}
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-
       - name: Install dependencies
         run: pip install -r requirements.txt
-
       - name: Run scraper
         run: python mm.py
-
       - name: Upload results as artifact
         uses: actions/upload-artifact@v4
         with:
           name: mimu-jobs-${{ github.run_number }}
-          path: |
-            mimu_jobs.csv
-            mimu_jobs.xlsx
-            processed_ids.csv
+          path: processed_ids.csv
           retention-days: 30
-
       - name: Commit results to repo
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          git add mimu_jobs.csv mimu_jobs.xlsx processed_ids.csv
+          git add processed_ids.csv
           git diff --cached --quiet || git commit -m "chore: update jobs data [$(date -u '+%Y-%m-%d %H:%M UTC')]"
           git push
