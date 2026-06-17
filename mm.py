@@ -1,15 +1,15 @@
 """
-MIMU Jobs PDF Extractor — v2 (Fixed)
-======================================
-Fixes applied vs v1:
-  - Job Type: tighter keyword matching (no false "Internship" hits)
-  - Job Qualifications: strict tier-map only, empty if no match
-  - Job Experience: strict band-map only, empty if no match
-  - Salary: strip prose, keep only numeric/currency amounts
-  - Company Address: strict address-pattern only, blank if none found
-  - Company Details: fetched from company website About page (not PDF)
-  - Job Description: fuller extraction (up to 1500 chars, more sections)
-  - Website scraper: improved About-page discovery
+MIMU Jobs PDF Extractor — v3
+==============================
+Fixes vs v2:
+  - Company Address: much stricter validation — rejects numbers-only, prose
+    sentences, operational words, anything without a real street/city marker
+  - Company Details: website is primary source; PDF "About" section is
+    fallback when no website is available or website scrape returns nothing
+  - Job Type "Volunteer": no longer triggered by "volunteer-based organization"
+    in the org description — only flags if the position itself is volunteer
+  - PDF company details extraction: searches for About/Background/Who We Are
+    sections, then org-name paragraphs, then first descriptive long sentence
 
 REQUIREMENTS:
     pip install requests pdfplumber pandas openpyxl beautifulsoup4
@@ -297,8 +297,16 @@ def detect_job_type(text: str, title: str) -> str:
         return "Internship"
     if re.search(r'\bpart[-\s]time\b', combined):
         return "Part-time"
+    # Volunteer: only count it if "volunteer" refers to the POSITION, not the org
+    # e.g. "volunteer based organization" should NOT make the job type Volunteer
     if re.search(r'\bvolunteer\b', combined):
-        return "Volunteer"
+        # Check if it's describing the org ("volunteer based", "volunteers")
+        org_vol = re.search(r'volunteer\s+(?:based|organization|member|network|corps)', combined)
+        pos_vol = re.search(r'(?:position|role|post|contract|type)[^\n]{0,50}volunteer|volunteer\s+(?:position|role|post|opportunity)', combined)
+        if pos_vol and not org_vol:
+            return "Volunteer"
+        if not org_vol:
+            return "Volunteer"
     if re.search(r'\bconsultant\b|\bconsultancy\b|\bterms of reference\b|\btor\b|\bservice provider\b|\brfa\b|\brfp\b', combined):
         return "Consultancy / Contract"
     if re.search(r'\bcontract\b|\bfixed[-\s]term\b|\btemporary\b|\bservice agreement\b', combined):
@@ -343,30 +351,67 @@ def extract_salary(text: str, sheet_salary: str) -> str:
 #  COMPANY ADDRESS — strict address patterns only
 # =============================================================================
 
+# Words that indicate a value is prose, not an address — reject immediately
+_PROSE_WORDS = re.compile(
+    r'\b(?:please|ensure|must|will|should|have|been|with|through|across|'
+    r'areas|regions|branches|townships|countries|programs|projects|staff|'
+    r'services|sector|parent|duty|based|grade|report|department|during|'
+    r'providing|working|seeking|implement|support|assist|manage)\b',
+    re.IGNORECASE
+)
+
+# A valid address MUST contain one of these structural markers
+_ADDR_MARKERS = re.compile(
+    r'\b(?:Street|Road|Avenue|Lane|Quarter|Ward|Township|Yangon|Mandalay|'
+    r'Nay\s*Pyi\s*Taw|Mawlamyine|Myanmar)\b',
+    re.IGNORECASE
+)
+
+# Patterns that look like real addresses — all must also pass _ADDR_MARKERS
 ADDRESS_PATTERNS = [
-    # "No. X, Street Name, Township, City"
-    r'No\.?\s*\(?[A-Z0-9\-]+\)?\s*[,\s]+[^\n,]{5,80}(?:Street|Road|Avenue|Lane|Quarter|Ward)[^\n,]{0,60}',
-    # Numbered street address
-    r'\b\d+[,\s]+[A-Z][^\n,]{10,80}(?:Street|Road|Avenue|Lane|Township|Yangon|Mandalay|Myanmar)[^\n,]{0,60}',
-    # "Address: ..." line
-    r'(?:address|office address|our office|located at|head office)[:\s]+([A-Z0-9#][^\n]{15,150})',
-    # Ward / Township patterns
-    r'(?:Ward|Township)\s+(?:No\.?\s*)?\(?[\w\s\-]+\)?\s*[,\s]+[^\n]{10,80}(?:Yangon|Mandalay|Myanmar|Township)',
+    # "No. X(B), Street Name, Ward/Quarter, Township"
+    r'No\.?\s*\(?[A-Z0-9][A-Z0-9\-]*\)?\s*[,\s]+[^\n]{5,120}(?:Street|Road|Avenue|Lane)',
+    # Hash-style: "#123, Street..."
+    r'#\s*\d+[,\s]+[^\n]{5,100}(?:Street|Road|Avenue|Lane|Township|Yangon|Mandalay)',
+    # "Address:" / "Office:" explicit label
+    r'(?:^|\n)\s*(?:address|office address|head office|office)[:\s]+([A-Z0-9#No\.][^\n]{15,150})',
+    # "Ward X, Township Y, City"  — only when it has at least two components
+    r'Ward\s+(?:No\.?\s*)?\(?\w[\w\s]*\)?\s*,\s*[^\n]{5,80}(?:Township|Yangon|Mandalay|Myanmar)',
 ]
 
 def extract_address(text: str) -> str:
-    """Return address-formatted string or empty — never sentences."""
+    """
+    Return a clean address string or empty string.
+    Rules:
+      - Must contain a structural address marker (Street/Road/Ward/Township/city)
+      - Must contain at least one digit (building/house number)
+      - Must NOT contain prose verbs or operational words
+      - Must be under 180 chars
+      - Must not be a lone number or single word
+    """
     if not text:
         return ""
     for pat in ADDRESS_PATTERNS:
-        m = re.search(pat, text, re.IGNORECASE)
-        if m:
-            val = (m.group(1) if m.lastindex else m.group(0)).strip().strip('.,')
-            # Must look like an address (has digit or known geo word)
-            if re.search(r'\d|Yangon|Mandalay|Township|Myanmar|Street|Road', val, re.IGNORECASE):
-                # Reject if it's clearly a sentence (>200 chars or has verb-like words)
-                if len(val) < 200 and not re.search(r'\b(?:please|ensure|must|will|should|have|been|with)\b', val, re.IGNORECASE):
-                    return val
+        for m in re.finditer(pat, text, re.IGNORECASE | re.MULTILINE):
+            val = (m.group(1) if m.lastindex else m.group(0)).strip().strip('.,\n')
+            # Clean up internal newlines
+            val = re.sub(r'\s*\n\s*', ', ', val).strip()
+            # Must have a digit (house/building number)
+            if not re.search(r'\d', val):
+                continue
+            # Must have an address structural word
+            if not _ADDR_MARKERS.search(val):
+                continue
+            # Reject prose sentences
+            if _PROSE_WORDS.search(val):
+                continue
+            # Reject if too short (single number) or too long (paragraph)
+            if len(val) < 10 or len(val) > 180:
+                continue
+            # Reject if it starts with just a number and nothing meaningful after
+            if re.match(r'^\d+\s*$', val):
+                continue
+            return val
     return ""
 
 # =============================================================================
@@ -705,8 +750,79 @@ def extract_description(text: str, sheet_desc: str) -> str:
     return s(sheet_desc)[:1500]
 
 # =============================================================================
-#  COMPANY FOUNDED EXTRACTOR
+#  COMPANY DETAILS FROM PDF — extract "About the organisation" section
 # =============================================================================
+
+# Section headers that introduce org background in PDFs
+ABOUT_ORG_HEADERS = [
+    r'about\s+(?:the\s+)?(?:organization|organisation|us|our\s+org)',
+    r'who\s+we\s+are',
+    r'background(?:\s+of\s+(?:the\s+)?(?:organization|organisation))?',
+    r'presentation\s+of\s+the\s+organization',
+    r'introduction(?:\s+to\s+(?:the\s+)?(?:organization|organisation))?',
+    r'about\s+[A-Z]{2,}',          # "About CARE", "About DRC" etc.
+    r'overview\s+of\s+(?:the\s+)?(?:organization|organisation)',
+    r'organisation\s+background',
+    r'(?:the\s+)?(?:organization|organisation)\s+overview',
+]
+
+def extract_company_details_from_pdf(text: str, org_name: str) -> str:
+    """
+    Extract an 'About the organisation' paragraph from the PDF text.
+    Returns up to 1000 chars of clean prose.
+    """
+    if not text:
+        return ""
+
+    lines = text.split("\n")
+
+    # 1. Try known section headers
+    for i, line in enumerate(lines):
+        for pat in ABOUT_ORG_HEADERS:
+            if re.search(pat, line, re.IGNORECASE):
+                block = []
+                for j in range(i + 1, min(i + 20, len(lines))):
+                    l = lines[j].strip()
+                    if not l:
+                        if block:   # stop at first blank line after content
+                            break
+                        continue
+                    # Stop at next section header (ALL-CAPS or ends with colon)
+                    if re.match(r'^[A-Z][A-Z\s/&]{5,}:?\s*$', l) and len(l) < 80:
+                        break
+                    block.append(l)
+                candidate = " ".join(block).strip()
+                if len(candidate) > 80:
+                    return candidate[:1000]
+
+    # 2. Look for a paragraph that mentions the org name and sounds like a description
+    if org_name and len(org_name) > 2:
+        org_short = org_name[:20]
+        for i, line in enumerate(lines):
+            if org_short.lower() in line.lower() and len(line) > 80:
+                # Grab this line + a few after it
+                block = [line.strip()]
+                for j in range(i + 1, min(i + 6, len(lines))):
+                    l = lines[j].strip()
+                    if not l or re.match(r'^[A-Z][A-Z\s/&]{5,}:?\s*$', l):
+                        break
+                    block.append(l)
+                candidate = " ".join(block).strip()
+                if len(candidate) > 100:
+                    return candidate[:1000]
+
+    # 3. Find the first paragraph > 100 chars that sounds like an org description
+    for line in lines:
+        l = line.strip()
+        if len(l) > 100 and re.search(
+            r'(?:is\s+(?:a|an|the)|was\s+(?:established|founded)|has\s+been|'
+            r'organization|organisation|non.profit|humanitarian|ngo|ingo|'
+            r'international|development|working\s+in|operating\s+in)',
+            l, re.IGNORECASE
+        ):
+            return l[:1000]
+
+    return ""
 
 def detect_company_founded(text: str) -> str:
     m = re.search(
@@ -827,9 +943,9 @@ def parse_pdf_fields(text: str, row: dict, website_cache: dict) -> dict:
     # ── Company info placeholders ─────────────────────────────────────────────
     org      = s(row.get("Company Name", ""))
     logo     = ""
-    details  = ""  # Must come from website, not PDF
+    details  = ""
 
-    # ── Fill ALL company info from website ─────────────────────────────────────
+    # ── Fill company info from website (primary source) ───────────────────────
     if website:
         cached = website_cache.get(website)
         if cached is None:
@@ -840,14 +956,18 @@ def parse_pdf_fields(text: str, row: dict, website_cache: dict) -> dict:
         else:
             print(f"      🌐 Using cached: {website}")
 
-        details  = cached.get("description", "")
-        logo     = cached.get("logo", "")
+        details   = cached.get("description", "")
+        logo      = cached.get("logo", "")
         if not address:
             address  = cached.get("address", "")
         if not founded:
             founded  = cached.get("founded", "")
         if not comp_type:
             comp_type = cached.get("company_type", "")
+
+    # ── Fallback: extract company details from PDF if website gave nothing ────
+    if not details and text:
+        details = extract_company_details_from_pdf(text, org)
 
     return {
         "Job Title":          str(title or ""),
@@ -880,7 +1000,7 @@ def parse_pdf_fields(text: str, row: dict, website_cache: dict) -> dict:
 
 def main():
     print("=" * 64)
-    print("  MIMU Jobs PDF Extractor v2")
+    print("  MIMU Jobs PDF Extractor v3")
     print(f"  Started : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print("=" * 64)
 
