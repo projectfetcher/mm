@@ -1,3 +1,34 @@
+"""
+MIMU Jobs PDF Extractor — v5 (fixed)
+==============================
+Fix in this version:
+  - job_listing_type now sends integer term IDs instead of slug strings,
+    resolving the HTTP 400 "job_listing_type[0] is not of type integer" error.
+  - Added wp_get_job_type_id() helper with caching to look up term IDs
+    from the WP REST API at runtime.
+
+New in v5 (on top of v4):
+  - Mistral paraphrasing: job titles, descriptions, company details, taglines.
+    ENABLE_PARAPHRASE=True triggers up to 4 attempts per title and 3 per paragraph,
+    with similarity gating, word-count checks, and verbose per-attempt logging.
+  - WordPress REST API posting: creates/updates job-listings and companies via
+    WP Job Manager endpoints. Uploads logos as WP Media attachments (data-URI or URL).
+  - Duplicate tracker (processed_ids.csv): records job IDs so re-runs are idempotent.
+  - All config via environment variables (WP_BASE_URL, WP_USERNAME, WP_APP_PASSWORD,
+    MISTRAL_API_KEY) — no hardcoded secrets.
+
+REQUIREMENTS:
+    pip install requests pdfplumber pymupdf pandas openpyxl beautifulsoup4 \
+    language-tool-python==2.7.1
+
+USAGE:
+    export WP_BASE_URL="https://myanmar.mimusjobs.com/wp-json/wp/v2"
+    export WP_USERNAME="admin"
+    export WP_APP_PASSWORD="xxxx xxxx xxxx xxxx"
+    export MISTRAL_API_KEY="sk-..."
+    python mimu_jobs_extractor_v5.py
+"""
+
 import requests
 import pdfplumber
 import fitz          # PyMuPDF
@@ -46,7 +77,7 @@ OUTPUT_XLSX        = "mimu_jobs.xlsx"
 PROCESSED_IDS_FILE = "processed_ids.csv"
 
 # ── WordPress ─────────────────────────────────────────────────────────────────
-WP_URL      = os.environ.get("WP_BASE_URL", "")          # e.g. https://site.com/wp-json/wp/v2
+WP_URL      = os.environ.get("WP_BASE_URL", "")   # e.g. https://myanmar.mimusjobs.com/wp-json/wp/v2
 WP_USER     = os.environ.get("WP_USERNAME", "")
 WP_PASSWORD = os.environ.get("WP_APP_PASSWORD", "")
 WP_BASE        = WP_URL.rstrip("/")
@@ -72,8 +103,6 @@ for _var, _val, _feature in [
 
 # =============================================================================
 #  GRAMMAR MODEL
-#  SentenceTransformer removed — similarity is computed via Mistral API instead,
-#  avoiding HuggingFace rate-limit (429) errors on GitHub Actions runners.
 # =============================================================================
 
 print("⏳ Loading LanguageTool grammar checker…")
@@ -919,7 +948,6 @@ def mistral_generate(prompt: str, max_tokens: int = 400, temperature: float = 0.
 #  TEXT HELPERS FOR PARAPHRASE
 # =============================================================================
 
-# Common mojibake sequences produced by mis-decoded UTF-8
 _MOJIBAKE = [
     ("Â", ""), ("â€™", "'"), ("â€œ", '"'), ("â€\x9d", '"'), ("â€", '"'),
     ("â€¢", "•"), ("â„¢", "™"), ("\u00a0", " "), ("\u200b", ""), ("\ufeff", ""),
@@ -928,33 +956,21 @@ _MOJIBAKE = [
 def _fix_mojibake(text: str) -> str:
     for pattern, replacement in _MOJIBAKE:
         text = text.replace(pattern, replacement)
-    # Strip non-printable control characters (keep newline \n = 0x0A)
     text = re.sub(r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]", "", text)
     return text
 
 def sanitize_text(text: str, is_url: bool = False, is_email: bool = False) -> str:
-    """
-    Clean and normalise text before sending to Mistral or WordPress.
-    - Fixes mojibake / encoding artefacts
-    - Strips HTML tags
-    - Collapses excess whitespace
-    - Removes markdown artefacts (##, **)
-    """
     if not isinstance(text, str):
         text = str(text) if text is not None else ""
     text = text.strip()
     if text in ("nan", "None", "NaN", "", "N/A", "n/a", "NA", "na"):
         return ""
     text = _fix_mojibake(text)
-    # For URLs/emails: just collapse whitespace, no further stripping
     if is_url or is_email:
         return re.sub(r"[ \t\r\n\f\v]+", " ", text).strip()
-    # Strip HTML tags
     text = re.sub(r"<[^>]+>", " ", text)
-    # Remove markdown artefacts
     text = re.sub(r"#+\s*", "", text)
     text = re.sub(r"\*\*", "", text)
-    # Keep only printable Latin + extended Latin + common punctuation
     text = re.sub(
         r"[^\x20-\x7E\n\u00C0-\u017F\u2013\u2014\u2018-\u201D\u2022]", "", text
     )
@@ -962,7 +978,6 @@ def sanitize_text(text: str, is_url: bool = False, is_email: bool = False) -> st
     return re.sub(r"\n{3,}", "\n\n", text).strip()
 
 def _grammar_correct(text: str) -> str:
-    """Apply LanguageTool grammar correction if available."""
     if not _GRAMMAR_ENABLED or not _grammar_tool:
         return text
     try:
@@ -971,38 +986,24 @@ def _grammar_correct(text: str) -> str:
         return text
 
 def clean_output(raw: str) -> str:
-    """
-    Strip model artefacts from Mistral output, fix encoding, apply grammar correction.
-    Handles: markdown fences, [INST] tags, leading labels, excess whitespace.
-    """
     if not raw:
         return ""
     raw = _fix_mojibake(raw)
-    # Remove markdown code fences
     raw = re.sub(r"```[a-z]*", "", raw).replace("```", "")
-    # Remove model instruction tags
     raw = re.sub(r"\[/?INST\]|</?s>", "", raw)
-    # Strip leading "Rewritten:", "Output:", etc.
     raw = re.sub(
         r"^(?:rewritten?|rephrased?|output|paraphrase[d]?)[:\s]+",
         "", raw, flags=re.IGNORECASE,
     )
-    # Strip markdown bold / headers / dividers
     raw = re.sub(r"\*\*|###|---", "", raw)
     raw = re.sub(r"[ \t]+", " ", raw)
     raw = re.sub(r"\n{3,}", "\n\n", raw)
     return _grammar_correct(raw.strip())
 
 def similarity_score(a: str, b: str) -> float:
-    """
-    Semantic similarity scored by Mistral (no HuggingFace download needed).
-    Asks the model to rate how semantically similar two texts are on 0-10,
-    then normalises to [0, 1].  Falls back to Jaccard on any API failure.
-    """
     if not a or not b:
         return 0.0
     if not MISTRAL_API_KEY:
-        # Fallback: Jaccard word overlap
         sa = set(a.lower().split())
         sb = set(b.lower().split())
         return len(sa & sb) / len(sa | sb) if (sa or sb) else 0.0
@@ -1017,7 +1018,6 @@ def similarity_score(a: str, b: str) -> float:
         score = float(re.search(r"\d+", raw).group()) if re.search(r"\d+", raw) else 5.0
         return min(max(score / 10.0, 0.0), 1.0)
     except Exception:
-        # Fallback: Jaccard word overlap
         sa = set(a.lower().split())
         sb = set(b.lower().split())
         return len(sa & sb) / len(sa | sb) if (sa or sb) else 0.0
@@ -1331,12 +1331,57 @@ def mark_failed(job_id, reason):
 def _wp_auth() -> tuple:
     return (WP_USER, WP_PASSWORD)
 
+
+# ── Job listing type term ID cache (populated at runtime) ────────────────────
+_JOB_TYPE_ID_CACHE: dict = {}
+
+def wp_get_job_type_id(slug: str) -> int:
+    """
+    Fetch the integer term ID for a given job_listing_type slug.
+    Results are cached in _JOB_TYPE_ID_CACHE so we only hit the API once per slug.
+    Returns 0 if the term cannot be found or the API is unavailable.
+    """
+    if slug in _JOB_TYPE_ID_CACHE:
+        return _JOB_TYPE_ID_CACHE[slug]
+
+    if not WP_USER or not WP_PASSWORD or not WP_BASE:
+        return 0
+
+    # The taxonomy endpoint for WP Job Manager is /wp/v2/job_listing_type
+    taxonomy_url = f"{WP_BASE}/job_listing_type"
+    try:
+        resp = requests.get(
+            taxonomy_url,
+            auth=_wp_auth(),
+            params={"slug": slug, "per_page": 1},
+            timeout=10,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            if data and isinstance(data, list) and len(data) > 0:
+                term_id = int(data[0]["id"])
+                _JOB_TYPE_ID_CACHE[slug] = term_id
+                log.info(f"      🏷  job_listing_type '{slug}' → term ID {term_id}")
+                return term_id
+            else:
+                log.warning(f"      ⚠ No term found for slug '{slug}' at {taxonomy_url}")
+        else:
+            log.warning(
+                f"      ⚠ Could not fetch job_listing_type terms "
+                f"(HTTP {resp.status_code}): {resp.text[:200]}"
+            )
+    except Exception as e:
+        log.error(f"      ✗ job_listing_type lookup error: {e}")
+
+    # Cache the miss so we don't retry on every job
+    _JOB_TYPE_ID_CACHE[slug] = 0
+    return 0
+
+
 def wp_upload_logo(logo: str, company_name: str) -> int:
     """
     Upload a logo to WP Media library.
-    Accepts either:
-      - data URI  → "data:image/png;base64,..."
-      - HTTP URL  → download then upload
+    Accepts either a data URI or an HTTP URL.
     Returns the WP attachment ID, or 0 on failure.
     """
     if not WP_USER or not WP_PASSWORD or not WP_MEDIA_URL:
@@ -1345,7 +1390,6 @@ def wp_upload_logo(logo: str, company_name: str) -> int:
         return 0
 
     try:
-        # Resolve bytes + mime from data URI or URL
         if logo.startswith("data:"):
             m = re.match(r'data:(image/[^;]+);base64,(.+)', logo, re.DOTALL)
             if not m:
@@ -1391,9 +1435,6 @@ def wp_get_or_create_company(record: dict) -> int:
     """
     Find existing WP company by name or create a new one.
     Returns the WP company post ID (or 0 on failure).
-
-    This assumes WP Job Manager with a 'companies' custom post type.
-    Adjust endpoint / meta keys to match your theme's CPT slug.
     """
     if not WP_USER or not WP_PASSWORD or not WP_COMPANY_URL:
         return 0
@@ -1461,54 +1502,67 @@ def wp_post_job(record: dict, company_id: int) -> tuple:
     Create a WP Job Manager job listing via REST API.
     Returns (wp_post_id, wp_post_url) or (0, "").
 
-    Meta keys follow WP Job Manager conventions; adjust if your theme differs.
+    KEY FIX: job_listing_type is sent as a list of integer term IDs,
+    not slug strings. The term ID is resolved via wp_get_job_type_id().
     """
     if not WP_USER or not WP_PASSWORD or not WP_JOBS_URL:
         return 0, ""
 
-    # Build the post content (description)
-    content = record.get("Job Description", "")
-
-    # Add How to Apply section
+    # Build post content
+    content     = record.get("Job Description", "")
     application = record.get("Application", "")
     if application:
-        how = f"\n\n<strong>How to Apply:</strong> {application}"
-        content += how
+        content += f"\n\n<strong>How to Apply:</strong> {application}"
 
     payload = {
         "title":   record.get("Job Title", "Untitled"),
         "status":  "publish",
         "content": content,
         "meta": {
-            # WP Job Manager core meta
-            "_job_location":    record.get("Job Location", ""),
-            "_application":     application,
-            "_company_name":    record.get("Company Name", ""),
-            "_company_website": record.get("Company Website", ""),
-            "_job_expires":     record.get("Deadline", ""),
-            # Extended / custom meta (adjust keys to your theme)
-            "_job_salary":      record.get("Salary Range", ""),
-            "_job_type":        record.get("Job Type", "Full-time"),
-            "_job_field":       record.get("Job Field", ""),
-            "_job_experience":  record.get("Job Experience", ""),
+            "_job_location":      record.get("Job Location", ""),
+            "_application":       application,
+            "_company_name":      record.get("Company Name", ""),
+            "_company_website":   record.get("Company Website", ""),
+            "_job_expires":       record.get("Deadline", ""),
+            "_job_salary":        record.get("Salary Range", ""),
+            "_job_type":          record.get("Job Type", "Full-time"),
+            "_job_field":         record.get("Job Field", ""),
+            "_job_experience":    record.get("Job Experience", ""),
             "_job_qualification": record.get("Job Qualifications", ""),
-            "_date_posted":     record.get("Date Posted", ""),
-            "_company_id":      str(company_id) if company_id else "",
-            "_company_type":    record.get("Company Type", ""),
-            "_company_founded": record.get("Company Founded", ""),
-            "_job_source_url":  record.get("Job URL", ""),
+            "_date_posted":       record.get("Date Posted", ""),
+            "_company_id":        str(company_id) if company_id else "",
+            "_company_type":      record.get("Company Type", ""),
+            "_company_founded":   record.get("Company Founded", ""),
+            "_job_source_url":    record.get("Job URL", ""),
         },
     }
 
-    # Attach job type taxonomy if supported
-    job_type_slug = {
-        "Full-time":             "full-time",
-        "Part-time":             "part-time",
-        "Internship":            "internship",
-        "Volunteer":             "volunteer",
-        "Consultancy / Contract":"contract",
-    }.get(record.get("Job Type", ""), "full-time")
-    payload["job_listing_type"] = [job_type_slug]
+    # ── Resolve job_listing_type term ID (THE KEY FIX) ────────────────────────
+    # Map our internal job type labels to the slugs used on the WP site.
+    # Edit these slugs if your site uses different ones
+    # (check: GET https://myanmar.mimusjobs.com/wp-json/wp/v2/job_listing_type)
+    slug_map = {
+        "Full-time":              "full-time",
+        "Part-time":              "part-time",
+        "Internship":             "internship",
+        "Volunteer":              "volunteer",
+        "Consultancy / Contract": "contract",
+    }
+    job_type_label = record.get("Job Type", "Full-time")
+    job_type_slug  = slug_map.get(job_type_label, "full-time")
+    term_id        = wp_get_job_type_id(job_type_slug)
+
+    if term_id:
+        # Send as a list of integers — this is what WP REST API requires
+        payload["job_listing_type"] = [term_id]
+        log.info(f"      🏷  Setting job_listing_type to term ID [{term_id}] ('{job_type_slug}')")
+    else:
+        # If we can't resolve the term ID, omit the field entirely
+        # rather than sending a slug and getting a 400 error
+        log.warning(
+            f"      ⚠ Could not resolve term ID for job type '{job_type_slug}' "
+            f"— job_listing_type will not be set for this listing."
+        )
 
     try:
         resp = requests.post(
@@ -1681,7 +1735,7 @@ def parse_pdf_fields(text: str, pdf_bytes, row: dict, website_cache: dict) -> di
 
 def main():
     print("=" * 64)
-    print("  MIMU Jobs PDF Extractor v5")
+    print("  MIMU Jobs PDF Extractor v5 (fixed)")
     print(f"  Started : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"  Paraphrase : {'ENABLED' if ENABLE_PARAPHRASE and MISTRAL_API_KEY else 'DISABLED'}")
     print(f"  WP Posting : {'ENABLED' if WP_USER and WP_PASSWORD and WP_URL else 'DISABLED'}")
@@ -1702,6 +1756,12 @@ def main():
         print("Columns:", list(df.columns))
         sys.exit(1)
 
+    # Pre-fetch all job_listing_type term IDs so we log them once upfront
+    if WP_USER and WP_PASSWORD and WP_URL:
+        print("\n      Pre-fetching job_listing_type term IDs …")
+        for slug in ["full-time", "part-time", "internship", "volunteer", "contract"]:
+            wp_get_job_type_id(slug)
+
     # Load duplicate tracker
     processed_ids, processed_urls = load_processed_ids()
     print(f"      Already processed: {len(processed_ids)} jobs")
@@ -1719,7 +1779,6 @@ def main():
         title   = s(row.get("Job Title", ""))
         num     = idx + 1
 
-        # ── Duplicate check ───────────────────────────────────────────────────
         job_id = make_job_id(pdf_url, title, s(row.get("Company Name", "")), idx)
         if job_id in processed_ids or (pdf_url and pdf_url in processed_urls):
             print(f"\n  [{num}/{total}] ⏭  SKIP (already processed): {title}")
@@ -1782,7 +1841,7 @@ def main():
     if WP_USER and WP_PASSWORD and WP_URL:
         for job_id, rec in paraphrased_records:
             print(f"\n  📤 Posting: {rec.get('Job Title', '?')}")
-            company_id = wp_get_or_create_company(rec)
+            company_id    = wp_get_or_create_company(rec)
             wp_id, wp_url = wp_post_job(rec, company_id)
             if wp_id:
                 mark_posted(job_id, wp_id, wp_url)
