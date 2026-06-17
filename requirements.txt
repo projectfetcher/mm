@@ -4,3 +4,6 @@ pymupdf
 pandas
 openpyxl
 beautifulsoup4
+sentence-transformers
+language-tool-python==2.7.1
+nltk
