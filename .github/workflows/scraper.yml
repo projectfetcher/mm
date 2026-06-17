@@ -20,6 +20,7 @@ jobs:
       WP_USERNAME:      ${{ secrets.WP_USERNAME }}
       WP_APP_PASSWORD:  ${{ secrets.WP_APP_PASSWORD }}
       MISTRAL_API_KEY:  ${{ secrets.MISTRAL_API_KEY }}
+      SHEET_ID:         ${{ secrets.SHEET_ID }}
 
     steps:
       - name: Checkout repo
