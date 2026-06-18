@@ -41,6 +41,7 @@ SHEET_CSV_URL = (
 )
 OUTPUT_CSV         = "mimu_jobs.csv"
 OUTPUT_XLSX        = "mimu_jobs.xlsx"
+SKIPPED_CSV        = "skipped_jobs.csv"
 PROCESSED_IDS_FILE = "processed_ids.csv"
 
 # ── WordPress ─────────────────────────────────────────────────────────────────
@@ -882,6 +883,110 @@ def detect_company_founded(text: str) -> str:
     return ""
 
 # =============================================================================
+#  JOB RECORD VALIDATION  —  reject junk before paraphrase / WP posting
+# =============================================================================
+#
+# These rules exist because the PDF/sheet extractor sometimes grabs a stray
+# fragment instead of the real job title — producing WordPress posts titled
+# "(no title)", "1", "2", "only", "Summary", "As soon as possible", or
+# "Application Letter and Updated Resume Submission Request".
+#
+# Validation runs on the EXTRACTED (pre-paraphrase) title, because paraphrasing
+# a junk fragment can turn it into something that looks like a plausible title
+# and would slip past these checks.
+# -----------------------------------------------------------------------------
+
+# Exact (cleaned, lower-cased) titles that are never real jobs.
+_JUNK_TITLE_EXACT = {
+    "summary", "only", "note", "notes", "annex", "annexure", "appendix",
+    "introduction", "background", "overview", "objective", "objectives",
+    "purpose", "scope", "general", "details", "description", "duties",
+    "responsibilities", "requirements", "qualifications", "experience",
+    "location", "deadline", "salary", "remuneration", "title", "position",
+    "vacancy", "vacancies", "advertisement", "advertisment", "announcement",
+    "untitled", "n/a", "na", "tbd", "tba", "yes", "no",
+    "as soon as possible", "asap", "immediately", "open",
+    "full time", "full-time", "part time", "part-time",
+    "contract", "permanent", "temporary", "consultancy",
+    "table", "figure", "annex 1", "annex 2", "annexure 1",
+}
+
+# Substrings that mean the "title" is really application / boilerplate text.
+_JUNK_TITLE_SUBSTR = [
+    "application letter", "resume submission", "cv submission",
+    "submission request", "updated resume", "send your cv",
+    "send your resume", "how to apply", "terms of reference",
+    "expression of interest", "letter of interest",
+]
+
+# Phrases that are clearly a deadline / date value, not a title.
+_DATE_TITLE_RE = re.compile(
+    r'^\s*(?:'
+    r'as soon as possible|asap|immediately|'
+    r'\d{1,2}[\s\-/.](?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)|'
+    r'(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+\d{1,2}|'
+    r'\d{1,2}[\s\-/.]\d{1,2}[\s\-/.]\d{2,4}'
+    r')',
+    re.IGNORECASE,
+)
+
+def _clean_title_for_check(title: str) -> str:
+    """Strip smart/plain quotes, brackets and surrounding punctuation/space."""
+    t = (title or "").strip()
+    # remove wrapping quotes (straight + curly) repeatedly
+    t = re.sub(r'^[\s"\'“”‘’()<>\[\]]+|[\s"\'“”‘’()<>\[\]]+$', "", t)
+    t = re.sub(r'\s+', ' ', t).strip()
+    return t
+
+def validate_job_record(record: dict) -> tuple:
+    """
+    Decide whether a record is a genuine job worth posting.
+    Returns (is_valid: bool, reason: str). reason == "" when valid.
+    """
+    raw_title = record.get("Job Title", "") or ""
+    title     = _clean_title_for_check(raw_title)
+    low       = title.lower()
+
+    # 1. Empty / whitespace-only
+    if not title:
+        return False, "empty title"
+
+    # 2. No alphabetic characters at all (e.g. "1", "2", "—", "“ 2 ”")
+    if not re.search(r'[A-Za-z]', title):
+        return False, f"title has no letters ({raw_title!r})"
+
+    # 3. Far too short to be a real title
+    if len(title) < 3:
+        return False, f"title too short ({title!r})"
+
+    # 4. Exact junk fragment / boilerplate phrase
+    if low in _JUNK_TITLE_EXACT:
+        return False, f"junk fragment title ({title!r})"
+
+    # 5. Boilerplate / application-instruction substrings
+    for sub in _JUNK_TITLE_SUBSTR:
+        if sub in low:
+            return False, f"boilerplate title ({title!r})"
+
+    # 6. Date / deadline phrase masquerading as a title
+    if _DATE_TITLE_RE.search(low):
+        return False, f"date/deadline as title ({title!r})"
+
+    # 7. Single bare digit-ish token already covered by (2); also reject titles
+    #    that are entirely punctuation/quotes after cleaning.
+    if not re.search(r'[A-Za-z0-9]', title):
+        return False, f"title has no alphanumerics ({raw_title!r})"
+
+    # 8. No usable content at all: empty description AND no application route.
+    #    Lenient threshold so genuine short postings still pass.
+    desc = (record.get("Job Description", "") or "").strip()
+    app  = (record.get("Application", "") or "").strip()
+    if len(desc) < 30 and not app:
+        return False, f"no usable content (desc={len(desc)} chars, no application)"
+
+    return True, ""
+
+# =============================================================================
 #  MISTRAL API
 # =============================================================================
 
@@ -1289,6 +1394,9 @@ def mark_posted(job_id, wp_id, wp_url=""):
 
 def mark_failed(job_id, reason):
     _upsert_row(job_id, {"Status": f"failed|{reason}"})
+
+def mark_skipped(job_id, reason):
+    _upsert_row(job_id, {"Status": f"skipped|{reason}"})
 
 # =============================================================================
 #  WORDPRESS REST API
@@ -1701,7 +1809,7 @@ def parse_pdf_fields(text: str, pdf_bytes, row: dict, website_cache: dict) -> di
 
 def main():
     print("=" * 64)
-    print("  MIMU Jobs PDF Extractor v5 (fixed)")
+    print("  MIMU Jobs PDF Extractor v6 (with junk filter)")
     print(f"  Started : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"  Paraphrase : {'ENABLED' if ENABLE_PARAPHRASE and MISTRAL_API_KEY else 'DISABLED'}")
     print(f"  WP Posting : {'ENABLED' if WP_USER and WP_PASSWORD and WP_URL else 'DISABLED'}")
@@ -1773,10 +1881,24 @@ def main():
         records.append((job_id, enriched))
         time.sleep(0.2)
 
-    # 3. Paraphrase
-    print(f"\n[3/4] Paraphrasing …")
+    # 3. Validate + Paraphrase
+    #    Validation runs on the EXTRACTED title (before paraphrasing) so that
+    #    junk fragments can't be reworded into something that looks legitimate.
+    print(f"\n[3/4] Validating and paraphrasing …")
     paraphrased_records = []
+    skipped_records     = []   # (job_id, record, reason)
+
     for job_id, rec in records:
+        is_valid, reason = validate_job_record(rec)
+        if not is_valid:
+            print(f"\n  🚫 SKIP — invalid job: {rec.get('Job Title','')!r}")
+            print(f"            reason: {reason}")
+            mark_skipped(job_id, reason)
+            rec_copy = dict(rec)
+            rec_copy["Skip Reason"] = reason
+            skipped_records.append((job_id, rec_copy, reason))
+            continue
+
         print(f"\n  ── {rec.get('Job Title', '?')} ──")
         rec["Job Title"]       = paraphrase_title(rec.get("Job Title", ""))
         rec["Job Description"] = paraphrase_description(rec.get("Job Description", ""))
@@ -1784,13 +1906,16 @@ def main():
         mark_paraphrased(job_id)
         paraphrased_records.append((job_id, rec))
 
-    # 4. Save CSV/XLSX + post to WordPress
+    print(f"\n      Valid jobs   : {len(paraphrased_records)}")
+    print(f"      Skipped junk : {len(skipped_records)}")
+
+    # 4. Save CSV/XLSX (valid only) + skipped log + post to WordPress
     print(f"\n[4/4] Saving outputs and posting to WordPress …")
     out_records = [rec for _, rec in paraphrased_records]
     out_df      = pd.DataFrame(out_records, columns=OUTPUT_COLUMNS)
 
     out_df.to_csv(OUTPUT_CSV, index=False, encoding="utf-8-sig")
-    print(f"      ✓ {OUTPUT_CSV}")
+    print(f"      ✓ {OUTPUT_CSV} ({len(out_df)} valid jobs)")
 
     with pd.ExcelWriter(OUTPUT_XLSX, engine="openpyxl") as writer:
         out_df.to_excel(writer, index=False, sheet_name="MIMU Jobs")
@@ -1801,7 +1926,18 @@ def main():
         ws.freeze_panes = "A2"
     print(f"      ✓ {OUTPUT_XLSX}")
 
-    # WordPress posting
+    # Write the rejected rows to a separate file for review
+    if skipped_records:
+        skipped_cols = OUTPUT_COLUMNS + ["Skip Reason"]
+        skipped_df   = pd.DataFrame(
+            [rec for _, rec, _ in skipped_records]
+        ).reindex(columns=skipped_cols)
+        skipped_df.to_csv(SKIPPED_CSV, index=False, encoding="utf-8-sig")
+        print(f"      ✓ {SKIPPED_CSV} ({len(skipped_df)} rejected — NOT posted)")
+    else:
+        print(f"      (no rejected jobs this run)")
+
+    # WordPress posting — only the validated records ever reach here
     wp_success = 0
     wp_failed  = 0
     if WP_USER and WP_PASSWORD and WP_URL:
@@ -1825,12 +1961,14 @@ def main():
     print(f"  ✅ COMPLETE")
     print(f"     Total rows in sheet : {total}")
     print(f"     New jobs processed  : {total_processed}")
+    print(f"     Valid (kept)        : {len(paraphrased_records)}")
+    print(f"     Skipped as junk     : {len(skipped_records)}")
     print(f"     PDF success         : {pdf_ok}")
     print(f"     Sheet-only          : {pdf_skip}")
     print(f"     Websites hit        : {len(website_cache)}")
     print(f"     WP posted OK        : {wp_success}")
     print(f"     WP failed           : {wp_failed}")
-    print(f"     Output              : {OUTPUT_CSV}, {OUTPUT_XLSX}")
+    print(f"     Output              : {OUTPUT_CSV}, {OUTPUT_XLSX}, {SKIPPED_CSV}")
     print(f"     Finished            : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print("=" * 64)
 
